@@ -2,3 +2,5 @@ streamlit==1.66.1
 pandas==3.0.2
 plotly==7.1.0
 requests==2.33.1
+streamlit-searchbox==0.1.23
+gspread>=6.1,<7
