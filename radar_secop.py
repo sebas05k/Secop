@@ -233,6 +233,44 @@ def resumen(df, modo):
             "ultimo": st.column_config.DateColumn("Último", format="YYYY-MM-DD")})
 
 
+VISTAS = ["🃏 Tarjetas", "📋 Tabla"]
+
+
+def tarjetas(df, es_proceso, pref):
+    kn = f"{pref}_n"
+    n = st.session_state.get(kn, 15)
+    claves_seg = {x["clave"] for x in st.session_state["seg"]}
+    for r in df.head(n).itertuples():
+        tarjeta(r, claves_seg, es_proceso, f"{pref}_g_{r.clave}")
+    if len(df) > n:
+        st.button(f"Ver más ({len(df) - n} restantes)", key=f"{pref}_mas", width="stretch",
+                  on_click=lambda: st.session_state.update({kn: n + 15}))
+
+
+def tabla_resultados(df, pref):
+    cols = [x for x in ["proveedor", "entidad", "contrato", "departamento", "valor", "estado", "fecha", "fecha_fin", "texto", "url"]
+            if df[x].notna().any()]
+    vista = df[cols].copy()
+    vista.insert(0, "⭐", False)
+    config = {
+        "⭐": st.column_config.CheckboxColumn("⭐", width="small"),
+        "proveedor": st.column_config.TextColumn("Empresa"),
+        "entidad": st.column_config.TextColumn("Entidad"),
+        "contrato": st.column_config.TextColumn("N.º contrato / proceso"),
+        "valor": st.column_config.NumberColumn("Valor (COP)", format="$%d"),
+        "fecha": st.column_config.DateColumn("Fecha", format="YYYY-MM-DD"),
+        "fecha_fin": st.column_config.DateColumn("Fin / cierre", format="YYYY-MM-DD"),
+        "texto": st.column_config.TextColumn("Descripción", width="large"),
+        "url": st.column_config.LinkColumn("SECOP", display_text="Abrir"),
+    }
+    editado = st.data_editor(vista, hide_index=True, height=480, key=f"{pref}_tabla",
+                             disabled=[x for x in vista.columns if x != "⭐"],
+                             column_config={k: v for k, v in config.items() if k in vista.columns})
+    marcados = df.loc[editado.index[editado["⭐"]]]
+    if st.button(f"📌 Guardar ⭐ en seguimiento ({len(marcados)})", key=f"{pref}_guardar_tabla", disabled=marcados.empty):
+        st.success(f"{guardar_en_seguimiento(r for _, r in marcados.iterrows())} guardado(s) en Guardados.")
+
+
 def mostrar_resultados(res, es_proceso, pref, modo=None):
     df = res["df"].drop_duplicates("clave")
     if df.empty:
@@ -242,15 +280,14 @@ def mostrar_resultados(res, es_proceso, pref, modo=None):
         df = df.sort_values("fecha_fin")  # primero los que cierran pronto
     elif modo and not modo.startswith("📄"):
         resumen(df, modo)
-    kn = f"{pref}_n"
-    n = st.session_state.get(kn, 15)
     st.caption(f"{len(df):,} resultados · {res['total']:,} en el portal")
-    claves_seg = {x["clave"] for x in st.session_state["seg"]}
-    for r in df.head(n).itertuples():
-        tarjeta(r, claves_seg, es_proceso, f"{pref}_g_{r.clave}")
-    if len(df) > n:
-        st.button(f"Ver más ({len(df) - n} restantes)", key=f"{pref}_mas", width="stretch",
-                  on_click=lambda: st.session_state.update({kn: n + 15}))
+    kv = f"{pref}_vista"
+    st.radio("Ver como", VISTAS, index=VISTAS.index(st.session_state.get("vista", VISTAS[0])), horizontal=True,
+             key=kv, label_visibility="collapsed", on_change=lambda: st.session_state.update(vista=st.session_state[kv]))
+    if st.session_state.get("vista") == VISTAS[1]:
+        tabla_resultados(df, pref)
+    else:
+        tarjetas(df, es_proceso, pref)
     st.download_button("⬇️ Descargar (CSV)", df.to_csv(index=False).encode("utf-8-sig"),
                        f"secop_{pref}.csv", "text/csv", key=f"{pref}_csv")
 
