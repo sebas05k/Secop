@@ -163,12 +163,28 @@ def contiene(col, texto):
     return f"upper({col}) like '{patron(texto)}'"
 
 
+def _flexible(palabra):
+    """Palabras largas escritas sin tilde: cada vocal pasa a comodín '_', así 'fundacion' encuentra FUNDACIÓN y
+    FUNDACION. En palabras cortas no se hace, para no traer ruido ('campo' no debe encontrar 'COMPETENCIA')."""
+    u = palabra.upper()
+    if len(u) >= 6 and u.isalpha() and not re.search(r"[ÁÉÍÓÚÜÑ]", u):
+        return re.sub(r"[AEIOU]", "_", u)
+    return palabra
+
+
+def contiene_palabras(col, texto):
+    """Todas las palabras deben aparecer, en cualquier orden ('fundacion campo' encuentra 'FUNDACIÓN PARA EL CAMPO').
+    Se ignoran las palabras de menos de 3 letras (de, la, el...), que no filtran nada."""
+    palabras = list(dict.fromkeys(t for t in texto.split() if len(t) >= 3)) or [texto.strip()]
+    return "(" + " AND ".join(contiene(col, _flexible(t)) for t in palabras) + ")"
+
+
 def sugerir(ds_id, cols, texto):
     """Valores más frecuentes que contienen `texto` en cada columna."""
     out = []
     for col in cols:
         try:
-            filas = api(ds_id, {"$select": f"{col}, count(*) as n", "$where": contiene(col, texto),
+            filas = api(ds_id, {"$select": f"{col}, count(*) as n", "$where": contiene_palabras(col, texto),
                                 "$group": col, "$order": "n DESC", "$limit": 6})
         except Exception:
             continue
@@ -192,7 +208,7 @@ def construir_where(c, f):
         modo, valor = f["rapida"]
         cols = [c[r] for r in MODOS[modo] if r in c]
         if cols:
-            return "(" + " OR ".join(contiene(col, valor) for col in cols) + ")"
+            return "(" + " OR ".join(contiene_palabras(col, valor) for col in cols) + ")"
 
     w, cols_busq = [], []
     for clave in f["buscar_en"]:
