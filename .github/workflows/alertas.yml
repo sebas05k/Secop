@@ -1,21 +1,20 @@
-
 name: Alertas SECOP
 
 on:
   schedule:
     - cron: "0 12 * * *"   # 12:00 UTC = 7:00 a. m. en Colombia (todos los días)
-  workflow_dispatch:        # permite ejecutarlo a mano desde la pestaña Actions
+  workflow_dispatch:       # permite ejecutarlo a mano desde la pestaña Actions
 
 jobs:
   alertas:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests pandas "gspread>=6.1,<7"
+      - run: pip install requests pandas "gspread>=6.1,<7" google-auth
       - run: python alertas.py
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
