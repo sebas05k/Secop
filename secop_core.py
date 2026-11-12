@@ -85,7 +85,14 @@ PISTAS = {
 ROLES = ["entidad", "departamento", "ciudad", "titulo", "descripcion", "estado", "modalidad",
          "tipo", "valor", "fecha", "fecha_fin", "proveedor", "nit", "url",
          "contrato", "proceso", "representante"]
-BUSQUEDA = {"descripcion": ("titulo", "descripcion"), "entidad": ("entidad",), "proveedor": ("proveedor",)}
+
+# ACTUALIZADO: Se añade "contrato" para el ruteo interno de los filtros
+BUSQUEDA = {
+    "descripcion": ("titulo", "descripcion"), 
+    "entidad": ("entidad",), 
+    "proveedor": ("proveedor",),
+    "contrato": ("contrato", "proceso")
+}
 
 # Modos de la búsqueda directa (con autocompletado)
 MODOS = {
@@ -203,34 +210,39 @@ def filtros_base(**kw):
 
 
 def construir_where(c, f):
-    # Búsqueda directa: ignora el resto de filtros (fechas, estado, etc.)
-    if f.get("rapida"):
-        modo, valor = f["rapida"]
-        cols = [c[r] for r in MODOS[modo] if r in c]
-        if cols:
-            return "(" + " OR ".join(contiene_palabras(col, valor) for col in cols) + ")"
-
+    # ACTUALIZADO: El bloque 'rapida' fue removido para obligar el uso de los filtros
+    # completos de fecha sin generar Timeouts en búsquedas por empresas/entidades.
+    
     w, cols_busq = [], []
     for clave in f["buscar_en"]:
-        cols_busq += [c[r] for r in BUSQUEDA[clave] if r in c]
+        if clave in BUSQUEDA:
+            cols_busq += [c[r] for r in BUSQUEDA[clave] if r in c]
+            
     if f["terminos"] and cols_busq:
         bloques = ["(" + " OR ".join(contiene(col, t) for col in cols_busq) + ")" for t in f["terminos"]]
         w.append("(" + (" AND " if f["todos"] else " OR ").join(bloques) + ")")
+        
     for t in f["excluir"]:
         w += [f"upper({col}) not like '{patron(t)}'" for col in cols_busq]
+        
     for rol, clave in (("departamento", "deptos"), ("estado", "estados"), ("modalidad", "modalidades"), ("tipo", "tipos")):
         if f[clave] and rol in c:
             w.append(f"{c[rol]} in (" + ", ".join(f"'{esc(v)}'" for v in f[clave]) + ")")
+            
     for rol, clave in (("ciudad", "ciudad"), ("entidad", "entidad")):
         if f[clave] and rol in c:
             w.append(contiene(c[rol], f[clave]))
+            
     if f["proveedor"]:
-        cols = [c[r] for r in ("proveedor", "nit") if r in c]
+        # ACTUALIZADO: Agregada la columna representante para ser más exhaustivos
+        cols = [c[r] for r in ("proveedor", "nit", "representante") if r in c] 
         if cols:
             w.append("(" + " OR ".join(contiene(col, f["proveedor"]) for col in cols) + ")")
+            
     if "fecha" in c:
         w.append(f"{c['fecha']} >= '{f['desde']}T00:00:00'")
         w.append(f"{c['fecha']} <= '{f['hasta']}T23:59:59'")
+        
     return " AND ".join(w)
 
 
