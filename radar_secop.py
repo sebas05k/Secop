@@ -428,13 +428,20 @@ def pagina_buscar():
 # ---------------------------------------------------------------------------
 # ⭐ Guardados y 🔔 alertas
 # ---------------------------------------------------------------------------
+TIPOS_ALERTA = {
+    "convocatorias": "🟢 Convocatorias abiertas (de cualquier modalidad)",
+    "adjudicados": "🏆 Contratos recién adjudicados (licitaciones, concursos…)",
+    "directos": "🤝 Contratos directos recientes (incluye prestación de servicios)",
+}
+
+
 def ajustes_alertas():
     perfil = st.session_state["perfil"]
     ds = sc.DATASETS[CONTRATOS]
     c, _ = columnas_de(ds)
     opts_depto = opciones("departamento", ds, c) if c else []
     with st.expander("🔔 Alertas diarias (Telegram o correo)"):
-        st.caption("Cada mañana te avisan las convocatorias nuevas que encajan con esto. Los avisos los envía alertas.py (GitHub Actions).")
+        st.caption("Cada mañana te avisan lo nuevo que encaja con esto. Los avisos los envía alertas.py (GitHub Actions).")
         v = st.session_state.get("al_ver", 0)
         gem = secreto("GEMINI_API_KEY")
         if gem:
@@ -453,6 +460,10 @@ def ajustes_alertas():
                         persistir_perfil(dict(texto=desc.strip(), sectores=[], extra="\n".join(r["terminos"]), **r))
                         st.session_state["al_ver"] = v + 1
                         st.rerun()
+        tipos = st.multiselect("Qué quieres que te avise", list(TIPOS_ALERTA), format_func=TIPOS_ALERTA.get, key=f"al_tip_{v}",
+                               default=[t for t in perfil.get("alertas_tipos", list(TIPOS_ALERTA)) if t in TIPOS_ALERTA])
+        vmin = st.number_input("Valor mínimo de los contratos (COP), para evitar contratos pequeños", min_value=0, step=10_000_000,
+                               value=int(perfil.get("valor_min_contratos") or 0), key=f"al_vmin_{v}")
         sectores = st.multiselect("Sectores", list(sc.PLANTILLAS), key=f"al_sec_{v}",
                                   default=[s for s in perfil.get("sectores", []) if s in sc.PLANTILLAS])
         extra = st.text_area("Palabras propias (una por línea)", height=110, key=f"al_ex_{v}",
@@ -464,9 +475,11 @@ def ajustes_alertas():
             terminos = list(dict.fromkeys([k for s in sectores for k in sc.PLANTILLAS[s]] + sc.partir(extra)))
             if not terminos:
                 st.warning("Elige un sector o escribe al menos una palabra.")
+            elif not tipos:
+                st.warning("Elige al menos un tipo de aviso.")
             else:
-                persistir_perfil(dict(terminos=terminos, excluir=sc.partir(excluir), deptos=deptos,
-                                      sectores=sectores, extra=extra.strip()))
+                persistir_perfil(dict(terminos=terminos, excluir=sc.partir(excluir), deptos=deptos, sectores=sectores,
+                                      extra=extra.strip(), alertas_tipos=tipos, valor_min_contratos=int(vmin)))
                 st.success("Alertas guardadas ✅" if ALM else "Guardado solo en esta sesión. Configura Google Sheets para que las alertas lo lean.")
 
 
