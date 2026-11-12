@@ -2,8 +2,11 @@
 Radar SECOP II — buscador simple de contratos y convocatorias (datos.gov.co).
 
 Dos pestañas:
-  🔎 Buscar     Panel unificado de filtros y parámetros
+  🔎 Buscar     una barra con autocompletado (empresa o persona, entidad, contrato)
+                y, debajo, oportunidades por sector
   ⭐ Guardados  lo que marcas con ⭐ (en Google Sheets si lo configuraste) y tus alertas diarias
+
+Archivos: radar_secop.py, secop_core.py, almacen.py (+ alertas.py y alertas.yml para los avisos).
 """
 import os
 import re
@@ -35,7 +38,7 @@ def secreto(nombre, defecto=None):
 
 sc.configurar_token(secreto("SOCRATA_APP_TOKEN"))
 
-# ---- Contraseña opcional ----
+# ---- Contraseña opcional (recomendado: la URL de Streamlit Cloud es pública) --
 _clave_app = secreto("APP_PASSWORD")
 if _clave_app and not st.session_state.get("acceso"):
     st.title("📡 Radar SECOP II")
@@ -49,23 +52,27 @@ if _clave_app and not st.session_state.get("acceso"):
 
 
 # ---------------------------------------------------------------------------
-# Wrappers con caché
+# Wrappers con caché (el núcleo no depende de Streamlit)
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def columnas_disponibles(ds_id):
     return sc.columnas_disponibles(ds_id)
 
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def valores_distintos(ds_id, col):
     return sc.valores_distintos(ds_id, col)
+
 
 @st.cache_data(ttl=600, show_spinner=False)
 def sugerir(ds_id, cols, texto):
     return sc.sugerir(ds_id, cols, texto)
 
+
 @st.cache_data(ttl=600, show_spinner=False)
 def traer(ds_id, select, where, order, limite):
     return sc.traer(ds_id, select, where, order, limite)
+
 
 def opciones(rol, ds, c):
     if rol not in c:
@@ -77,7 +84,7 @@ def opciones(rol, ds, c):
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets: perfil y seguimiento
+# Google Sheets: perfil y seguimiento (si no está configurado, vive solo en la sesión)
 # ---------------------------------------------------------------------------
 @st.cache_resource(ttl=300, show_spinner=False)
 def _conectar():
@@ -89,7 +96,9 @@ def _conectar():
     except Exception as e:
         return None, str(e)[:300]
 
+
 ALM, ALM_ERR = _conectar()
+
 
 def seguro(fn, defecto, mensaje):
     try:
@@ -98,15 +107,19 @@ def seguro(fn, defecto, mensaje):
         st.warning(f"{mensaje}: {str(e)[:200]}")
         return defecto
 
+
 if "perfil" not in st.session_state:
     st.session_state["perfil"] = seguro(ALM.leer_perfil, {}, "No pude leer tu perfil") if ALM else {}
 if "seg" not in st.session_state:
     st.session_state["seg"] = seguro(ALM.leer_seguimiento, [], "No pude leer tu seguimiento") if ALM else []
 
+
 def _s(v):
     return v if isinstance(v, str) else ""
 
+
 def fila_seg(r):
+    """Fila de seguimiento a partir de un registro (dict o Series) del DataFrame de resultados."""
     fin, val = r.get("fecha_fin"), r.get("valor")
     return {
         "clave": r["clave"], "estado": ESTADOS[0], "notas": "",
@@ -116,7 +129,9 @@ def fila_seg(r):
         "url": _s(r.get("url")), "guardado": date.today().isoformat(),
     }
 
+
 def guardar_en_seguimiento(registros):
+    """Agrega registros (iterable de dict/Series) sin duplicar. Devuelve cuántos eran nuevos."""
     seg = st.session_state["seg"]
     existentes = {x["clave"] for x in seg}
     nuevas = []
@@ -130,6 +145,7 @@ def guardar_en_seguimiento(registros):
             seguro(lambda: ALM.agregar_seguimiento(nuevas), None, "No pude guardar en Google Sheets")
     return len(nuevas)
 
+
 def persistir_perfil(nuevo):
     perfil = st.session_state["perfil"]
     if all(perfil.get(k) == v for k, v in nuevo.items()):
@@ -137,6 +153,7 @@ def persistir_perfil(nuevo):
     perfil.update(nuevo)
     if ALM:
         seguro(lambda: ALM.guardar_perfil(perfil), None, "No pude guardar tu perfil")
+
 
 def aviso_almacenamiento():
     if ALM_ERR:
@@ -146,13 +163,16 @@ def aviso_almacenamiento():
 
 
 # ---------------------------------------------------------------------------
-# Utilidades de presentación y UI
+# Utilidades de presentación
 # ---------------------------------------------------------------------------
 def md(texto):
+    """Escapa caracteres que Streamlit interpretaría como formato ($ activa fórmulas)."""
     return re.sub(r"([\\$*_`#\[\]<>~|])", r"\\\1", texto or "")
+
 
 def fmt_fecha(v):
     return "" if pd.isna(v) else v.strftime("%d/%m/%Y")
+
 
 def tarjeta(r, claves_seg, es_proceso, clave_widget):
     guardado = r.clave in claves_seg
@@ -173,19 +193,20 @@ def tarjeta(r, claves_seg, es_proceso, clave_widget):
         st.caption(md(" · ".join(datos)))
         a, b = st.columns(2)
         if r.url:
-            a.link_button("Abrir en SECOP", r.url, use_container_width=True)
-        b.button("✅ Guardado" if guardado else "⭐ Guardar", key=clave_widget, disabled=guardado, use_container_width=True,
+            a.link_button("Abrir en SECOP", r.url, width="stretch")
+        b.button("✅ Guardado" if guardado else "⭐ Guardar", key=clave_widget, disabled=guardado, width="stretch",
                  on_click=guardar_en_seguimiento, args=([r._asdict()],))
 
+
+# ---------------------------------------------------------------------------
+# 🔎 Buscar: una barra con autocompletado + oportunidades por sector
+# ---------------------------------------------------------------------------
 CONTRATOS, CONVOCATORIAS = "📜 Contratos (ya firmados)", "🟢 Convocatorias (procesos)"
 NOMBRE_SECCION = {CONTRATOS: "📜 Contratos", CONVOCATORIAS: "🟢 Convocatorias"}
 PREFIJO = {CONTRATOS: "con", CONVOCATORIAS: "pro"}
-PLACEHOLDER = {
-    "🏢 Empresa o persona": "Nombre, NIT o cédula…", 
-    "🏛️ Entidad": "Ej: unidad para las víctimas",
-    "📄 Contrato / proceso": "Número de contrato o proceso…"
-}
-VISTAS = ["🃏 Tarjetas", "📋 Tabla"]
+PLACEHOLDER = {"🏢 Empresa o persona": "Nombre, NIT o cédula…", "🏛️ Entidad": "Ej: unidad para las víctimas",
+               "📄 Contrato / proceso": "Número de contrato o proceso…"}
+
 
 def columnas_de(ds):
     try:
@@ -193,7 +214,9 @@ def columnas_de(ds):
     except Exception as e:
         return None, str(e)[:200]
 
+
 def resumen(df, modo):
+    """Cifras clave de una empresa/persona o de una entidad (solo para contratos firmados)."""
     es_entidad = modo.startswith("🏛️")
     otra, plural = ("proveedor", "Empresas") if es_entidad else ("entidad", "Entidades")
     a, b = st.columns(2)
@@ -209,6 +232,10 @@ def resumen(df, modo):
             "valor_total": st.column_config.NumberColumn("Valor total", format="$%d"),
             "ultimo": st.column_config.DateColumn("Último", format="YYYY-MM-DD")})
 
+
+VISTAS = ["🃏 Tarjetas", "📋 Tabla"]
+
+
 def tarjetas(df, es_proceso, pref):
     kn = f"{pref}_n"
     n = st.session_state.get(kn, 15)
@@ -216,8 +243,9 @@ def tarjetas(df, es_proceso, pref):
     for r in df.head(n).itertuples():
         tarjeta(r, claves_seg, es_proceso, f"{pref}_g_{r.clave}")
     if len(df) > n:
-        st.button(f"Ver más ({len(df) - n} restantes)", key=f"{pref}_mas", use_container_width=True,
+        st.button(f"Ver más ({len(df) - n} restantes)", key=f"{pref}_mas", width="stretch",
                   on_click=lambda: st.session_state.update({kn: n + 15}))
+
 
 def tabla_resultados(df, pref):
     cols = [x for x in ["proveedor", "entidad", "contrato", "departamento", "valor", "estado", "fecha", "fecha_fin", "texto", "url"]
@@ -242,14 +270,15 @@ def tabla_resultados(df, pref):
     if st.button(f"📌 Guardar ⭐ en seguimiento ({len(marcados)})", key=f"{pref}_guardar_tabla", disabled=marcados.empty):
         st.success(f"{guardar_en_seguimiento(r for _, r in marcados.iterrows())} guardado(s) en Guardados.")
 
+
 def mostrar_resultados(res, es_proceso, pref, modo=None):
     df = res["df"].drop_duplicates("clave")
     if df.empty:
         st.info("Sin resultados. Prueba con menos palabras o quita filtros.")
         return
     if es_proceso:
-        df = df.sort_values("fecha_fin")  
-    elif modo and modo not in ["📄 Contrato / proceso", "🔍 Palabras clave / Objeto"]:
+        df = df.sort_values("fecha_fin")  # primero los que cierran pronto
+    elif modo and not modo.startswith("📄"):
         resumen(df, modo)
     st.caption(f"{len(df):,} resultados · {res['total']:,} en el portal")
     kv = f"{pref}_vista"
@@ -263,100 +292,137 @@ def mostrar_resultados(res, es_proceso, pref, modo=None):
                        f"secop_{pref}.csv", "text/csv", key=f"{pref}_csv")
 
 
-# ---------------------------------------------------------------------------
-# 🔎 Buscar: Interfaz Unificada
-# ---------------------------------------------------------------------------
+PERIODOS = {"Último mes": 30, "Últimos 3 meses": 90, "Último año": 365, "Últimos 3 años": 1095, "Todo el historial": None}
+
+
+def opciones_union(rol):
+    """Valores posibles de un campo en contratos y convocatorias, sin repetir."""
+    vals = set()
+    for ds in sc.DATASETS.values():
+        c, _ = columnas_de(ds)
+        if c:
+            vals |= set(opciones(rol, ds, c))
+    return sorted(vals)
+
+
+def resultados(b):
+    """Corre la búsqueda guardada en `b` en contratos y convocatorias, y muestra cada una en su pestaña.
+    Las consultas quedan en caché, así que mostrar de nuevo (⭐, Ver más, cambiar vista) no vuelve a consultar."""
+    if st.session_state.get("_ultima") != b["id"]:
+        st.session_state.update(_ultima=b["id"], con_n=15, pro_n=15)
+    st.caption("Buscando: " + b["resumen"])
+    hoy = date.today()
+    dias = PERIODOS[b["periodo"]]
+    desde = str(hoy - timedelta(days=dias)) if dias else "2000-01-01"
+    salidas, notas = {}, {}
+    for nombre, ds in sc.DATASETS.items():
+        c, err = columnas_de(ds)
+        es_proceso = nombre == CONVOCATORIAS
+        if err:
+            salidas[nombre] = ("error", err)
+        elif b["valor"] and not any(r in c for r in sc.MODOS[b["modo"]]):
+            salidas[nombre] = ("vacio", None)
+        else:
+            try:
+                validos = [d for d in b["deptos"] if d in opciones("departamento", ds, c)]
+                if b["deptos"] and not validos:
+                    notas[nombre] = "El departamento elegido no figura en este conjunto de datos, así que se muestra todo el país."
+                estados = sc.estados_abiertos(opciones("estado", ds, c)) if es_proceso and b["solo_abiertas"] and "estado" in c else []
+                f = sc.filtros_base(
+                    rapida=(b["modo"], b["valor"]) if b["valor"] else None, terminos=b["terminos"], excluir=b["excluir"],
+                    deptos=validos, ciudad=b["ciudad"],
+                    entidad=b["entidad"], proveedor=b["proveedor"], modalidades=b["modalidades"], tipos=b["tipos"],
+                    estados=estados, desde=desde, hasta=str(hoy), solo_vigentes=es_proceso and b["solo_abiertas"],
+                    valor_min=b["valor_min"], limite=1000)
+                with st.spinner(f"Buscando en {NOMBRE_SECCION[nombre]}…"):
+                    salidas[nombre] = ("ok", sc.ejecutar(ds, c, f, traer))
+            except Exception as e:
+                salidas[nombre] = ("error", str(e)[:250])
+    etiquetas = [NOMBRE_SECCION[n] + (f" ({d['total']:,})" if e == "ok" else "") for n, (e, d) in salidas.items()]
+    for tab, (nombre, (estado, dato)) in zip(st.tabs(etiquetas), salidas.items()):
+        with tab:
+            if notas.get(nombre):
+                st.caption("⚠️ " + notas[nombre])
+            if estado == "ok":
+                mostrar_resultados(dato, nombre == CONVOCATORIAS, PREFIJO[nombre], b["modo"] if b["valor"] else None)
+            elif estado == "error":
+                st.warning(f"No pude consultar {NOMBRE_SECCION[nombre]}: {dato}")
+                st.button("🔄 Reintentar", key=f"reintentar_{PREFIJO[nombre]}")
+            else:
+                st.caption("Este conjunto de datos no tiene esa información. Prueba con otro tipo de búsqueda.")
+
+
 def pagina_buscar():
-    st.markdown("### 🔎 Configura tu búsqueda")
-    
-    # --- SELECCIÓN DE DATASET ---
-    tipo_ds = st.radio("¿Qué quieres buscar?", [CONTRATOS, CONVOCATORIAS], horizontal=True, label_visibility="collapsed")
-    ds = sc.DATASETS[tipo_ds]
-    es_proceso = (tipo_ds == CONVOCATORIAS)
+    ds = sc.DATASETS[CONTRATOS]
     c, err = columnas_de(ds)
-    
     if err:
-        st.error(f"No pude leer el dataset: {err}")
+        st.error(f"No pude leer el dataset de contratos: {err}")
         return
 
-    # --- PANEL DE FILTROS ---
-    with st.form("form_busqueda"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("#### 1. ¿Sobre qué?")
-            modo = st.selectbox("Modo de búsqueda", list(sc.MODOS) + ["🔍 Palabras clave / Objeto"])
-            
-            if modo == "🔍 Palabras clave / Objeto":
-                valor_busqueda = st.text_input("Palabras en el objeto del contrato", placeholder="Ej: café, tecnología, acueducto")
-            else:
-                valor_busqueda = st.text_input(PLACEHOLDER.get(modo, "Escribe aquí..."), placeholder=PLACEHOLDER.get(modo))
-            
-            sectores = st.multiselect("O filtra por Sector (Plantillas)", list(sc.PLANTILLAS))
-            
-        with col2:
-            st.markdown("#### 2. ¿Cuándo y Dónde?")
-            hoy = date.today()
-            dias_defecto = 90 if es_proceso else 365
-            rango_fechas = st.date_input("Rango de fechas", [hoy - timedelta(days=dias_defecto), hoy])
-            
-            opts_depto = opciones("departamento", ds, c)
-            deptos = st.multiselect("Departamentos (vacío = Todos)", opts_depto)
-        
-        with st.expander("3. Más filtros (Exclusiones, montos, estados)"):
-            c_exc, c_val = st.columns(2)
-            excluir = c_exc.text_input("Excluir palabras", placeholder="Ej: vigilancia, papelería")
-            valor_min = c_val.number_input("Valor mínimo (COP)", min_value=0, value=0, step=10_000_000)
-            
-            estados = []
-            if es_proceso:
-                opts_estado = opciones("estado", ds, c)
-                estados = st.multiselect("Estados del proceso", opts_estado, default=sc.estados_abiertos(opts_estado))
+    # 1) Barra con autocompletado (opcional): un nombre concreto
+    st.markdown("##### 1 · ¿Buscas a alguien o algo en concreto? (opcional)")
+    modo = st.radio("Buscar por", list(sc.MODOS), horizontal=True, label_visibility="collapsed", key="b_modo")
 
-        buscar_btn = st.form_submit_button("🚀 Buscar Oportunidades", type="primary", use_container_width=True)
-
-    # --- EJECUCIÓN DE LA BÚSQUEDA ---
-    if buscar_btn:
-        if len(rango_fechas) != 2:
-            st.warning("Selecciona una fecha de inicio y una de fin.")
-            return
-            
-        desde, hasta = rango_fechas
-        
-        terminos = list(dict.fromkeys([k for s in sectores for k in sc.PLANTILLAS[s]]))
-        if modo == "🔍 Palabras clave / Objeto" and valor_busqueda.strip():
-            terminos.extend(sc.partir(valor_busqueda))
-            
-        filtros = sc.filtros_base(
-            terminos=terminos,
-            excluir=sc.partir(excluir),
-            deptos=deptos,
-            estados=estados,
-            desde=str(desde),
-            hasta=str(hasta),
-            solo_vigentes=es_proceso,
-            valor_min=int(valor_min),
-            limite=1500
-        )
-
-        if valor_busqueda.strip() and modo != "🔍 Palabras clave / Objeto":
-            if modo == "🏛️ Entidad":
-                filtros["entidad"] = valor_busqueda.strip()
-            elif modo == "🏢 Empresa o persona":
-                filtros["proveedor"] = valor_busqueda.strip()
-            elif modo == "📄 Contrato / proceso":
-                filtros["buscar_en"] = ["contrato"]
-                filtros["terminos"] = [valor_busqueda.strip()]
-
+    def buscador(texto):
+        t = (texto or "").strip()
+        if len(t) < 3:
+            return []
+        roles = sc.MODOS[modo]
+        if re.fullmatch(r"[\d.\-\s]+", t):          # solo números: NIT, cédula o nº de contrato
+            roles = [r for r in roles if r in ("nit", "contrato", "proceso")] or roles
+        else:                                      # con letras no tiene sentido mirar el NIT
+            roles = [r for r in roles if r != "nit"]
+        cols = tuple(c[r] for r in roles if r in c)
         try:
-            with st.spinner(f"Buscando en {tipo_ds} (fechas: {desde} a {hasta})..."):
-                res = sc.ejecutar(ds, c, filtros, traer)
-            
-            st.divider()
-            mostrar_resultados(res, es_proceso, PREFIJO[tipo_ds], modo)
-            
-        except Exception as e:
-            st.error(f"La consulta falló o tardó demasiado: {e}")
+            return sugerir(ds["id"], cols, t) if cols else []
+        except Exception:   # si datos.gov.co tarda, no se rompe la página: simplemente no hay sugerencias
+            return []
+
+    placeholder = PLACEHOLDER.get(modo, "Escribe 3+ letras…")
+    if st_searchbox:
+        valor = st_searchbox(buscador, placeholder=placeholder, key=f"sb_{modo}")
+    else:  # respaldo sin el paquete: escribe + Enter, luego elige
+        txt = st.text_input(placeholder, key=f"txt_{modo}", label_visibility="collapsed", placeholder=placeholder)
+        sug = buscador(txt)
+        valor = st.selectbox("Sugerencias", sug, index=None, key=f"sel_{modo}_{txt}") if sug else None
+        valor = valor or (txt.strip() if len(txt.strip()) >= 3 else None)
+
+    # 2) Filtros (todos opcionales y combinables)
+    st.markdown("##### 2 · Filtros (todos opcionales)")
+    with st.form("filtros"):
+        a, b_ = st.columns(2)
+        sectores = a.multiselect("Sector", list(sc.PLANTILLAS))
+        extra = a.text_input("Palabras en el objeto", placeholder="ej: café, acuicultura")
+        excluir = a.text_input("Excluir palabras", placeholder="ej: vigilancia, aseo")
+        deptos = b_.multiselect("Departamento (vacío = todos)", opciones_union("departamento"))
+        periodo = b_.selectbox("Periodo", list(PERIODOS), index=2,
+                               help="Contratos: fecha de firma. Convocatorias: fecha de publicación. Para ver todo el historial de una empresa elige «Todo el historial».")
+        solo_abiertas = b_.checkbox("Convocatorias: solo abiertas", value=True)
+        with st.expander("Más filtros"):
+            m1, m2 = st.columns(2)
+            valor_min = m1.number_input("Valor mínimo (COP)", min_value=0, value=0, step=10_000_000)
+            ciudad = m1.text_input("Ciudad o municipio contiene")
+            entidad = m2.text_input("Entidad contiene")
+            proveedor = m2.text_input("Empresa, persona o NIT contiene")
+            modalidades = st.multiselect("Modalidad de contratación", opciones_union("modalidad"))
+            tipos = st.multiselect("Tipo de contrato", opciones_union("tipo"))
+        enviado = st.form_submit_button("🔎 Buscar", type="primary", width="stretch")
+
+    if enviado:
+        terminos = list(dict.fromkeys([k for s_ in sectores for k in sc.PLANTILLAS[s_]] + sc.partir(extra)))
+        partes = [f"{modo} «{valor}»" if valor else None, ", ".join(sectores) or None,
+                  f"palabras: {extra.strip()}" if extra.strip() else None, ", ".join(deptos) or None, periodo.lower()]
+        spec = dict(
+            modo=modo, valor=valor, terminos=terminos, excluir=sc.partir(excluir), deptos=deptos, ciudad=ciudad.strip(),
+            entidad=entidad.strip(), proveedor=proveedor.strip(), modalidades=modalidades, tipos=tipos, periodo=periodo,
+            solo_abiertas=solo_abiertas, valor_min=int(valor_min), resumen=" · ".join(p for p in partes if p))
+        st.session_state["busq"] = {**spec, "id": repr(spec)}
+    b = st.session_state.get("busq")
+    if not b:
+        st.caption("Elige lo que quieras (un nombre, un sector, un departamento…) y pulsa «Buscar».")
+        return
+    st.divider()
+    resultados(b)
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +440,7 @@ def ajustes_alertas():
         if gem:
             desc = st.text_area("Cuéntame qué haces y la IA propone las palabras (opcional)", value=perfil.get("texto", ""),
                                 height=90, key=f"al_desc_{v}")
-            if st.button("✨ Proponer con IA", use_container_width=True):
+            if st.button("✨ Proponer con IA", width="stretch"):
                 if len(desc.strip()) < 15:
                     st.warning("Cuéntame un poco más (profesión, experiencia, zona).")
                 else:
@@ -394,7 +460,7 @@ def ajustes_alertas():
         excluir = st.text_input("Excluir palabras", value=", ".join(perfil.get("excluir", [])), key=f"al_exc_{v}")
         deptos = st.multiselect("Departamentos (vacío = todos)", opts_depto, key=f"al_dp_{v}",
                                 default=[d for d in perfil.get("deptos", []) if d in opts_depto])
-        if st.button("💾 Guardar alertas", type="primary", use_container_width=True):
+        if st.button("💾 Guardar alertas", type="primary", width="stretch"):
             terminos = list(dict.fromkeys([k for s in sectores for k in sc.PLANTILLAS[s]] + sc.partir(extra)))
             if not terminos:
                 st.warning("Elige un sector o escribe al menos una palabra.")
@@ -442,7 +508,7 @@ def pagina_seguimiento():
             "url": st.column_config.LinkColumn("SECOP", display_text="Abrir"),
         })
     a, b = st.columns(2)
-    if a.button("💾 Guardar cambios", type="primary", use_container_width=True):
+    if a.button("💾 Guardar cambios", type="primary", width="stretch"):
         quedan = editado[~editado["quitar"]]
         nuevo = [{k: ("" if pd.isna(fila[k]) else str(fila[k])) for k in COLS_SEG} for _, fila in quedan.iterrows()]
         st.session_state["seg"] = nuevo
@@ -450,7 +516,7 @@ def pagina_seguimiento():
             seguro(lambda: ALM.guardar_seguimiento(nuevo), None, "No pude guardar en Google Sheets")
         st.rerun()
     b.download_button("⬇️ Descargar (CSV)", pd.DataFrame(seg, columns=COLS_SEG).to_csv(index=False).encode("utf-8-sig"),
-                      "seguimiento_secop.csv", "text/csv", use_container_width=True)
+                      "seguimiento_secop.csv", "text/csv", width="stretch")
 
 
 # ---------------------------------------------------------------------------
