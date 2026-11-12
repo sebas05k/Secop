@@ -85,14 +85,7 @@ PISTAS = {
 ROLES = ["entidad", "departamento", "ciudad", "titulo", "descripcion", "estado", "modalidad",
          "tipo", "valor", "fecha", "fecha_fin", "proveedor", "nit", "url",
          "contrato", "proceso", "representante"]
-
-# ACTUALIZADO: Se añade "contrato" para el ruteo interno de los filtros
-BUSQUEDA = {
-    "descripcion": ("titulo", "descripcion"), 
-    "entidad": ("entidad",), 
-    "proveedor": ("proveedor",),
-    "contrato": ("contrato", "proceso")
-}
+BUSQUEDA = {"descripcion": ("titulo", "descripcion"), "entidad": ("entidad",), "proveedor": ("proveedor",)}
 
 # Modos de la búsqueda directa (con autocompletado)
 MODOS = {
@@ -119,8 +112,15 @@ PLANTILLAS = {
 # ---------------------------------------------------------------------------
 # API de datos.gov.co
 # ---------------------------------------------------------------------------
-def api(ds_id, params):
-    r = requests.get(f"{BASE}/resource/{ds_id}.json", params=params, headers=HEADERS, timeout=60)
+TIMEOUT = 45  # segundos que se espera una respuesta de datos.gov.co
+
+
+def api(ds_id, params, timeout=TIMEOUT):
+    try:
+        r = requests.get(f"{BASE}/resource/{ds_id}.json", params=params, headers=HEADERS, timeout=timeout)
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"datos.gov.co tardó más de {timeout} s en responder. Reintenta o afina la búsqueda "
+                           "(más palabras o una entidad concreta). Con un token de datos.gov.co suele responder más rápido.")
     if r.status_code != 200:
         raise RuntimeError(f"datos.gov.co respondió {r.status_code}: {r.text[:300]}")
     return r.json()
@@ -210,55 +210,55 @@ def filtros_base(**kw):
 
 
 def construir_where(c, f):
-    # ACTUALIZADO: El bloque 'rapida' fue removido para obligar el uso de los filtros
-    # completos de fecha sin generar Timeouts en búsquedas por empresas/entidades.
-    
     w, cols_busq = [], []
-    for clave in f["buscar_en"]:
-        if clave in BUSQUEDA:
-            cols_busq += [c[r] for r in BUSQUEDA[clave] if r in c]
-            
-    if f["terminos"] and cols_busq:
-        bloques = ["(" + " OR ".join(contiene(col, t) for col in cols_busq) + ")" for t in f["terminos"]]
-        w.append("(" + (" AND " if f["todos"] else " OR ").join(bloques) + ")")
-        
-    for t in f["excluir"]:
-        w += [f"upper({col}) not like '{patron(t)}'" for col in cols_busq]
-        
-    for rol, clave in (("departamento", "deptos"), ("estado", "estados"), ("modalidad", "modalidades"), ("tipo", "tipos")):
-        if f[clave] and rol in c:
-            w.append(f"{c[rol]} in (" + ", ".join(f"'{esc(v)}'" for v in f[clave]) + ")")
-            
-    for rol, clave in (("ciudad", "ciudad"), ("entidad", "entidad")):
-        if f[clave] and rol in c:
-            w.append(contiene(c[rol], f[clave]))
-            
-    if f["proveedor"]:
-        # ACTUALIZADO: Agregada la columna representante para ser más exhaustivos
-        cols = [c[r] for r in ("proveedor", "nit", "representante") if r in c] 
-        if cols:
-            w.append("(" + " OR ".join(contiene(col, f["proveedor"]) for col in cols) + ")")
-            
     if "fecha" in c:
         w.append(f"{c['fecha']} >= '{f['desde']}T00:00:00'")
         w.append(f"{c['fecha']} <= '{f['hasta']}T23:59:59'")
-        
+    if f.get("rapida"):  # nombre elegido en la barra (empresa/persona, entidad o contrato); se suma a los demás filtros
+        modo, valor = f["rapida"]
+        cols = [c[r] for r in MODOS[modo] if r in c]
+        if cols:
+            w.append("(" + " OR ".join(contiene_palabras(col, valor) for col in cols) + ")")
+    for clave in f["buscar_en"]:
+        cols_busq += [c[r] for r in BUSQUEDA[clave] if r in c]
+    if f["terminos"] and cols_busq:
+        bloques = ["(" + " OR ".join(contiene(col, t) for col in cols_busq) + ")" for t in f["terminos"]]
+        w.append("(" + (" AND " if f["todos"] else " OR ").join(bloques) + ")")
+    for t in f["excluir"]:
+        w += [f"upper({col}) not like '{patron(t)}'" for col in cols_busq]
+    for rol, clave in (("departamento", "deptos"), ("estado", "estados"), ("modalidad", "modalidades"), ("tipo", "tipos")):
+        if f[clave] and rol in c:
+            w.append(f"{c[rol]} in (" + ", ".join(f"'{esc(v)}'" for v in f[clave]) + ")")
+    for rol, clave in (("ciudad", "ciudad"), ("entidad", "entidad")):
+        if f[clave] and rol in c:
+            w.append(contiene_palabras(c[rol], f[clave]))
+    if f["proveedor"]:
+        cols = [c[r] for r in ("proveedor", "nit") if r in c]
+        if cols:
+            w.append("(" + " OR ".join(contiene_palabras(col, f["proveedor"]) for col in cols) + ")")
     return " AND ".join(w)
 
 
 def traer(ds_id, select, where, order, limite):
-    """Devuelve (total de coincidencias en el portal, DataFrame con hasta `limite` filas)."""
+    """Devuelve (total de coincidencias en el portal, DataFrame con hasta `limite` filas).
+    Primero baja los datos; solo si llegó al límite (puede haber más) gasta una consulta extra en contar."""
     base = {"$where": where} if where else {}
-    total = int(list(api(ds_id, {**base, "$select": "count(*)"})[0].values())[0])
     filas = []
-    while len(filas) < min(limite, total):
-        params = {**base, "$select": select, "$limit": min(5000, limite - len(filas)), "$offset": len(filas)}
+    while len(filas) < limite:
+        n = min(5000, limite - len(filas))
+        params = {**base, "$select": select, "$limit": n, "$offset": len(filas)}
         if order:
             params["$order"] = order
         lote = api(ds_id, params)
-        if not lote:
-            break
         filas += lote
+        if len(lote) < n:
+            break
+    total = len(filas)
+    if total >= limite:
+        try:
+            total = int(list(api(ds_id, {**base, "$select": "count(*)"}, timeout=20)[0].values())[0])
+        except Exception:
+            pass  # no se pudo contar: se muestra al menos lo descargado
     return total, pd.DataFrame(filas)
 
 
@@ -295,9 +295,9 @@ def ejecutar(ds, c, f, traer_fn=traer):
     df, ignorados = pd.DataFrame(), 0
     if not crudo.empty:
         df, ignorados = normalizar(crudo, c, f["tope"])
-        if f["solo_vigentes"] and "fecha_fin" in c and not f.get("rapida"):
+        if f["solo_vigentes"] and "fecha_fin" in c:
             df = df[df["vigente"]]
-        if f["valor_min"] and not f.get("rapida"):
+        if f["valor_min"]:
             df = df[df["valor"].fillna(0) >= f["valor_min"]]
     return dict(where=where, select=select, order=order, total=total, n_crudo=len(crudo), df=df, ignorados=ignorados)
 
