@@ -83,7 +83,9 @@ def correo(usuario, clave, destino, asunto, cuerpo):
 
 def filtros_perfil(perfil, desde, **extra):
     hoy = date.today()
-    return sc.filtros_base(terminos=perfil["terminos"], excluir=perfil.get("excluir", []), deptos=perfil.get("deptos", []),
+    excluir = list(perfil.get("excluir", [])) + (sc.RUIDO_TIPICO if perfil.get("quitar_ruido", True) else [])
+    return sc.filtros_base(terminos=perfil.get("terminos", []), reglas=perfil.get("reglas", []), excluir_local=excluir,
+                           deptos=perfil.get("deptos", []),
                            ciudad=perfil.get("ciudad", ""), desde=str(desde), hasta=str(hoy), limite=500, **extra)
 
 
@@ -111,7 +113,10 @@ def contratos_nuevos(perfil, ya):
     print(f"Contratos: {res['total']} coincidencias en el portal, {len(df)} tras filtros.")
     if df.empty:
         return df, df
-    df = df[~df["clave"].isin(ya)].drop_duplicates("clave").sort_values("valor", ascending=False)
+    df = df[~df["clave"].isin(ya)].drop_duplicates("clave")
+    # primero lo que más se parece a tu perfil (más palabras del núcleo), y a igual relevancia lo de mayor valor
+    df = df.assign(_rel=sc.puntaje(df, perfil.get("terminos", []), perfil.get("reglas", []))).sort_values(
+        ["_rel", "valor"], ascending=False)
     directos = df["modalidad"].fillna("").str.contains("directa", case=False)
     return df[~directos], df[directos]
 
@@ -123,7 +128,7 @@ def main():
     alm = Almacen(json.loads(cred), sheet_id)
 
     perfil = alm.leer_perfil()
-    if not perfil.get("terminos"):
+    if not (perfil.get("terminos") or perfil.get("reglas")):
         print("Tu perfil aún no tiene palabras clave. Defínelas en la app (pestaña Guardados → Alertas) y guárdalas.")
         return
     tipos = [t for t in (perfil.get("alertas_tipos") or TIPOS) if t in TIPOS]
