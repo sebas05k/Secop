@@ -435,13 +435,54 @@ TIPOS_ALERTA = {
 }
 
 
+def vista_previa(perfil, tipos):
+    """Muestra lo que traería la alerta hoy con estos ajustes (no envía nada ni marca nada como visto)."""
+    import alertas
+    secciones = []
+    try:
+        with st.spinner("Consultando datos.gov.co… (puede tardar un minuto)"):
+            if "convocatorias" in tipos:
+                secciones.append(("🟢 Convocatorias abiertas", alertas.convocatorias_nuevas(perfil, set())))
+            if "adjudicados" in tipos or "directos" in tipos:
+                adj, dire = alertas.contratos_nuevos(perfil, set())
+                if "adjudicados" in tipos:
+                    secciones.append(("🏆 Contratos adjudicados", adj))
+                if "directos" in tipos:
+                    secciones.append(("🤝 Contratos directos", dire))
+    except Exception as e:
+        st.error(f"No pude consultar: {e}")
+        return
+    secciones = [(t, df) for t, df in secciones if not df.empty]
+    total = sum(len(df) for _, df in secciones)
+    if not total:
+        st.info("Con estos ajustes hoy no llegaría nada. Si es demasiado estricto, agrega palabras al núcleo o combinaciones.")
+        return
+    if total > 40:
+        st.warning(f"Hoy te llegarían {total} avisos: son muchos. Mira qué palabras traen más resultados y ajusta.")
+    else:
+        st.success(f"Hoy te llegarían {total} avisos.")
+    tabla = sc.conteo_por_palabra(pd.concat([df for _, df in secciones]), perfil.get("terminos", []), perfil.get("reglas", []))
+    with st.expander("Qué palabras y combinaciones traen más resultados"):
+        st.dataframe(tabla.head(25), hide_index=True)
+        st.caption("Si una fila trae muchísimos resultados que no son de tu área, bórrala o hazla más específica.")
+    for titulo, df in secciones:
+        st.markdown(f"**{titulo}: {len(df)}**")
+        for r in df.head(8).itertuples():
+            quien = f"{r.proveedor} · " if isinstance(r.proveedor, str) and r.proveedor else ""
+            valor = f" · ${r.valor:,.0f}" if pd.notna(r.valor) else ""
+            st.markdown(f"- {md((r.texto or '')[:120])} — {md(quien)}{md(r.entidad or '')}{valor}")
+
+
 def ajustes_alertas():
     perfil = st.session_state["perfil"]
     ds = sc.DATASETS[CONTRATOS]
     c, _ = columnas_de(ds)
     opts_depto = opciones("departamento", ds, c) if c else []
-    with st.expander("🔔 Alertas diarias (Telegram o correo)"):
+    estricto = "nucleo" in perfil   # ya guardaste el perfil restrictivo
+    with st.expander("🔔 Alertas diarias (Telegram o correo)", expanded=not estricto):
         st.caption("Cada mañana te avisan lo nuevo que encaja con esto. Los avisos los envía alertas.py (GitHub Actions).")
+        if not estricto:
+            st.info("🎯 Te dejé cargado el perfil restrictivo de ingeniería agronómica. Revísalo, pulsa «Ver qué traería hoy» y luego «Guardar alertas».")
         v = st.session_state.get("al_ver", 0)
         gem = secreto("GEMINI_API_KEY")
         if gem:
@@ -457,29 +498,54 @@ def ajustes_alertas():
                     except Exception as e:
                         st.error(str(e))
                     else:
-                        persistir_perfil(dict(texto=desc.strip(), sectores=[], extra="\n".join(r["terminos"]), **r))
+                        persistir_perfil(dict(texto=desc.strip(), sectores=[], nucleo="\n".join(r["terminos"]), combos="",
+                                              reglas=[], **r))
                         st.session_state["al_ver"] = v + 1
                         st.rerun()
         tipos = st.multiselect("Qué quieres que te avise", list(TIPOS_ALERTA), format_func=TIPOS_ALERTA.get, key=f"al_tip_{v}",
                                default=[t for t in perfil.get("alertas_tipos", list(TIPOS_ALERTA)) if t in TIPOS_ALERTA])
         vmin = st.number_input("Valor mínimo de los contratos (COP), para evitar contratos pequeños", min_value=0, step=10_000_000,
                                value=int(perfil.get("valor_min_contratos") or 0), key=f"al_vmin_{v}")
-        sectores = st.multiselect("Sectores", list(sc.PLANTILLAS), key=f"al_sec_{v}",
-                                  default=[s for s in perfil.get("sectores", []) if s in sc.PLANTILLAS])
-        extra = st.text_area("Palabras propias (una por línea)", height=110, key=f"al_ex_{v}",
-                             value=perfil.get("extra", "\n".join(perfil.get("terminos", []))))
-        excluir = st.text_input("Excluir palabras", value=", ".join(perfil.get("excluir", [])), key=f"al_exc_{v}")
+        st.markdown("**🎯 Palabras que bastan solas** (una por línea)")
+        nucleo = st.text_area("Núcleo", height=190, key=f"al_nuc_{v}", label_visibility="collapsed",
+                              value=perfil.get("nucleo", "\n".join(sc.NUCLEO_AGRONOMO)))
+        st.markdown("**🧩 Combinaciones** (una por línea)")
+        st.caption("Ambas partes deben aparecer; «|» separa alternativas. Ej: «UARIV + PRODUCTIV | RURAL» = UARIV junto con "
+                   "PRODUCTIV o RURAL. Sirve para palabras generales (apoyo, supervisor, QGIS…) que solas traerían ruido. "
+                   "Usa «_» en lugar de una vocal con tilde.")
+        combos = st.text_area("Combinaciones", height=190, key=f"al_cmb_{v}", label_visibility="collapsed",
+                              value=perfil.get("combos", sc.COMBOS_AGRONOMO))
+        sectores = st.multiselect("Sectores completos (opcional; traen más ruido)", list(sc.PLANTILLAS), key=f"al_sec_{v}",
+                                  default=[s_ for s_ in perfil.get("sectores", []) if s_ in sc.PLANTILLAS])
+        excluir = st.text_input("Excluir palabras", key=f"al_exc_{v}",
+                                value=", ".join(perfil.get("excluir", []) if estricto else sc.EXCLUIR_AGRONOMO))
         deptos = st.multiselect("Departamentos (vacío = todos)", opts_depto, key=f"al_dp_{v}",
                                 default=[d for d in perfil.get("deptos", []) if d in opts_depto])
+        ruido = st.checkbox("Quitar ruido típico (médicos, abogados, deportes, eventos, aseo…)", key=f"al_ruido_{v}",
+                            value=bool(perfil.get("quitar_ruido", True)))
+        terminos = list(dict.fromkeys([k for s_ in sectores for k in sc.PLANTILLAS[s_]] + sc.partir(nucleo)))
+        reglas = sc.texto_a_reglas(combos)
+        malas = sc.palabras_genericas(terminos)
+        if malas:
+            st.warning("Estas palabras son demasiado generales y traen mucho ruido; mejor pásalas a una combinación: " + ", ".join(malas))
+        sueltas = [ln.strip() for ln in combos.splitlines() if ln.strip() and not sc.texto_a_reglas(ln)]
+        if sueltas:
+            st.warning("Estas líneas de combinaciones no tienen «+» y se ignoran: " + " · ".join(sueltas[:3]))
+        if st.button("👀 Ver qué traería hoy", width="stretch", key="al_prev"):
+            if terminos or reglas:
+                vista_previa(dict(terminos=terminos, reglas=reglas, excluir=sc.partir(excluir), deptos=deptos,
+                                  valor_min_contratos=int(vmin), quitar_ruido=ruido), tipos or list(TIPOS_ALERTA))
+            else:
+                st.warning("Escribe al menos una palabra o una combinación.")
         if st.button("💾 Guardar alertas", type="primary", width="stretch"):
-            terminos = list(dict.fromkeys([k for s in sectores for k in sc.PLANTILLAS[s]] + sc.partir(extra)))
-            if not terminos:
-                st.warning("Elige un sector o escribe al menos una palabra.")
+            if not (terminos or reglas):
+                st.warning("Escribe al menos una palabra o una combinación.")
             elif not tipos:
                 st.warning("Elige al menos un tipo de aviso.")
             else:
-                persistir_perfil(dict(terminos=terminos, excluir=sc.partir(excluir), deptos=deptos, sectores=sectores,
-                                      extra=extra.strip(), alertas_tipos=tipos, valor_min_contratos=int(vmin)))
+                persistir_perfil(dict(terminos=terminos, reglas=reglas, nucleo=nucleo.strip(), combos=combos.strip(),
+                                      excluir=sc.partir(excluir), deptos=deptos, sectores=sectores, alertas_tipos=tipos,
+                                      valor_min_contratos=int(vmin), quitar_ruido=ruido))
                 st.success("Alertas guardadas ✅" if ALM else "Guardado solo en esta sesión. Configura Google Sheets para que las alertas lo lean.")
 
 
