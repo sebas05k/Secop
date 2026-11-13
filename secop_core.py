@@ -7,6 +7,7 @@ import json
 import os
 import re
 from datetime import date, timedelta
+from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
@@ -96,7 +97,8 @@ MODOS = {
 
 # "_" funciona como comodín de un carácter: AGR_COLA encuentra AGRÍCOLA y AGRICOLA
 PLANTILLAS = {
-    "🌱 Agro": ["AGR_COLA", "AGRONOM", "AGROPECUARI", "FITOSANIT", "SEMILLA", "VIVERO", "UMATA", "CULTIVO", "SEGURIDAD ALIMENTARIA"],
+    "🌱 Agro": ["AGR_COLA", "AGR_NOM", "AGROPECUARI", "AGROECOL", "AGROFORESTAL", "FITOSANIT", "FITOPATOL", "SEMILLA", "VIVERO",
+               "UMATA", "EXTENSI_N RURAL", "DESARROLLO RURAL", "PROYECTOS PRODUCTIVOS", "SUSTITUCI_N DE CULTIVOS", "REFORMA AGRARIA"],
     "📐 Arquitectura y diseño": ["ARQUITECT", "DISE_O", "URBANISMO", "PAISAJISM"],
     "🏗️ Obras civiles": ["OBRA CIVIL", "CONSTRUCCI_N", "ADECUACI_N", "REHABILITACI_N", "MEJORAMIENTO DE VIA"],
     "🔍 Interventoría": ["INTERVENTOR_A", "SUPERVISI_N T_CNICA"],
@@ -170,6 +172,92 @@ def contiene(col, texto):
     return f"upper({col}) like '{patron(texto)}'"
 
 
+# ---------------------------------------------------------------------------
+# Perfil restrictivo: "núcleo" (palabras que bastan solas) + "combinaciones" (A + B: deben aparecer ambas)
+# Las palabras generales (apoyo, profesional, supervisor, UARIV, QGIS...) NO bastan solas: solo cuentan junto a un tema agro.
+# ---------------------------------------------------------------------------
+NUCLEO_AGRONOMO = [
+    "AGR_NOM", "AGROPECUARI", "AGROECOL", "AGROFORESTAL", "FITOSANIT", "FITOPATOL", "SANIDAD VEGETAL",
+    "EXTENSI_N AGROPECUARIA", "EXTENSI_N RURAL", "UMATA", "ASISTENCIA T_CNICA RURAL", "PROYECTOS PRODUCTIVOS",
+    "AGRICULTURA CAMPESINA", "AGRICULTURA FAMILIAR", "HUERTA", "HORTALIZA",
+]
+COMBOS_AGRONOMO = """DESARROLLO RURAL + ASISTENCIA T_CNICA | EXTENSI_N | PRODUCTIV | AGRO | CULTIV
+AGR_COLA + PROFESIONAL | T_CNIC | ASISTENCIA | APOYO | SUPERVIS | EXTENSI_N
+CULTIV + ASISTENCIA T_CNICA | PROFESIONAL | APOYO | SUPERVIS
+APOYO EN CAMPO + AGRO | AGR_COLA | CULTIV | PRODUCTIV | RURAL
+SUPERVIS + AGRO | AGR_COLA | PRODUCTIV | RURAL
+UARIV | V_CTIMAS + PRODUCTIV | RURAL | AGRO | AGR_COLA | HUERTA
+SOBERAN_A ALIMENTARIA | SEGURIDAD ALIMENTARIA + RURAL | CAMPESIN | PRODUCTIV | HUERTA | AGRO
+QGIS | GEORREFERENC | CARTOGRAF | INFORMACI_N GEOGR_FICA + AGRO | AGR_COLA | RURAL | CULTIV
+AN_LISIS DE DATOS + AGRO | AGR_COLA | RURAL | CULTIV"""
+EXCLUIR_AGRONOMO = ["RACIONES", "COMBUSTIBLE"]
+PLANTILLAS["🎯 Ingeniería agronómica (estricta)"] = NUCLEO_AGRONOMO
+
+
+def texto_a_reglas(texto):
+    """'A | B + C | D' (una combinación por línea) → [[['A','B'],['C','D']], ...]. Cada lado necesita al menos una palabra."""
+    reglas = []
+    for linea in (texto or "").splitlines():
+        grupos = [[p.strip() for p in g.split("|") if p.strip()] for g in linea.split("+")]
+        grupos = [g for g in grupos if g]
+        if len(grupos) >= 2:
+            reglas.append(grupos)
+    return reglas
+
+
+def reglas_a_texto(reglas):
+    return "\n".join(" + ".join(" | ".join(g) for g in r) for r in reglas)
+
+
+# Contratos que casi nunca interesan a un agrónomo ni a un arquitecto y se cuelan por palabras sueltas
+RUIDO_TIPICO = ["M_DICO", "M_DICA", "ODONT_LOG", "ENFERMER", "PSIC_LOG", "ABOGAD", "JUR_DIC", "CONTADOR", "CONTABLE",
+                "ART_STIC", "ESC_NIC", "DEPORT", "ALIMENTACI_N ESCOLAR", "VIGILANCIA", "ASEO", "CAFETER_A", "PAPELER_A",
+                "ROPA HOSPITALARIA", "DOTACI_N HOSPITALARIA", "FESTIVAL", "FIESTAS"]
+
+# Palabras que, solas, aparecen en casi cualquier contrato: no sirven como palabra clave
+_GENERALES = {"PRESTACI_N", "PRESTAR", "SERVICIO", "SERVICIOS", "PROFESIONAL", "PROFESIONALES", "APOYO", "GESTI_N", "ASESOR_A",
+              "ASESOR", "ASESORAR", "CONSULTOR_A", "ESTUDIO", "ESTUDIOS", "DIAGN_STICO", "CAPACITACI_N", "FORMACI_N", "EDUCACI_N",
+              "DE", "LA", "EL", "LOS", "LAS", "PARA", "Y", "EN", "A", "COMO", "CONTRATO", "TECNICO", "T_CNICO", "ACTIVIDADES"}
+
+
+def palabras_genericas(terminos):
+    """Palabras clave formadas solo por palabras muy generales (ej. 'prestación de servicios profesionales')."""
+    def norm(t):
+        return re.sub(r"[ÁÉÍÓÚÜÑ]", "_", t.upper()).split()
+    return [t for t in terminos if norm(t) and all(w in _GENERALES for w in norm(t))]
+
+
+def _rx(t):
+    """Palabra clave estilo LIKE ('_' = cualquier carácter) → expresión regular, para contar coincidencias en pandas."""
+    return re.escape(re.sub(r"[ÁÉÍÓÚÜÑ]", "_", t.upper())).replace("_", ".")
+
+
+def _coincide_regla(textos, regla):
+    ok = pd.Series(True, index=textos.index)
+    for grupo in regla:
+        ok &= textos.str.contains("|".join(_rx(x) for x in grupo), regex=True)
+    return ok
+
+
+def puntaje(df, terminos, reglas=()):
+    """Relevancia de cada fila: 2 puntos por palabra del núcleo y 1 por combinación cumplida (para ordenar)."""
+    textos = df["texto"].fillna("").str.upper()
+    p = pd.Series(0, index=df.index)
+    for t in terminos:
+        p += 2 * textos.str.contains(_rx(t), regex=True).astype(int)
+    for r in reglas:
+        p += _coincide_regla(textos, r).astype(int)
+    return p
+
+
+def conteo_por_palabra(df, terminos, reglas=()):
+    """Cuántos resultados trae cada palabra clave o combinación (para detectar las que meten ruido)."""
+    textos = df["texto"].fillna("").str.upper()
+    filas = [(t, int(textos.str.contains(_rx(t), regex=True).sum())) for t in terminos]
+    filas += [(" + ".join(" | ".join(g) for g in r), int(_coincide_regla(textos, r).sum())) for r in reglas]
+    return pd.DataFrame(filas, columns=["palabra", "resultados"]).sort_values("resultados", ascending=False)
+
+
 def _flexible(palabra):
     """Palabras largas escritas sin tilde: cada vocal pasa a comodín '_', así 'fundacion' encuentra FUNDACIÓN y
     FUNDACION. En palabras cortas no se hace, para no traer ruido ('campo' no debe encontrar 'COMPETENCIA')."""
@@ -209,34 +297,62 @@ def filtros_base(**kw):
     return f
 
 
-def construir_where(c, f):
-    w, cols_busq = [], []
+MAX_URL = 5000  # largo máximo (ya codificado) del filtro de una consulta; si se pasa, se parte en varias
+
+
+def construir_wheres(c, f, max_url=MAX_URL):
+    """Lista de filtros SoQL. Normalmente es uno; si hay tantas palabras que la dirección sería demasiado larga,
+    se reparten en varias consultas cuyos resultados se unen después."""
+    base, cols_busq, alts = [], [], []
     if "fecha" in c:
-        w.append(f"{c['fecha']} >= '{f['desde']}T00:00:00'")
-        w.append(f"{c['fecha']} <= '{f['hasta']}T23:59:59'")
+        base.append(f"{c['fecha']} >= '{f['desde']}T00:00:00'")
+        base.append(f"{c['fecha']} <= '{f['hasta']}T23:59:59'")
     if f.get("rapida"):  # nombre elegido en la barra (empresa/persona, entidad o contrato); se suma a los demás filtros
         modo, valor = f["rapida"]
         cols = [c[r] for r in MODOS[modo] if r in c]
         if cols:
-            w.append("(" + " OR ".join(contiene_palabras(col, valor) for col in cols) + ")")
+            base.append("(" + " OR ".join(contiene_palabras(col, valor) for col in cols) + ")")
     for clave in f["buscar_en"]:
         cols_busq += [c[r] for r in BUSQUEDA[clave] if r in c]
-    if f["terminos"] and cols_busq:
-        bloques = ["(" + " OR ".join(contiene(col, t) for col in cols_busq) + ")" for t in f["terminos"]]
-        w.append("(" + (" AND " if f["todos"] else " OR ").join(bloques) + ")")
+    reglas = f.get("reglas") or []
+    if (f["terminos"] or reglas) and cols_busq:
+        def en_cols(t):
+            return "(" + " OR ".join(contiene(col, t) for col in cols_busq) + ")"
+        alts = [en_cols(t) for t in f["terminos"]]
+        for regla in reglas:  # cada grupo es un OR de alternativas; los grupos de una regla se unen con AND
+            alts.append("(" + " AND ".join("(" + " OR ".join(en_cols(x) for x in g) + ")" for g in regla) + ")")
     for t in f["excluir"]:
-        w += [f"upper({col}) not like '{patron(t)}'" for col in cols_busq]
+        base += [f"upper({col}) not like '{patron(t)}'" for col in cols_busq]
     for rol, clave in (("departamento", "deptos"), ("estado", "estados"), ("modalidad", "modalidades"), ("tipo", "tipos")):
         if f[clave] and rol in c:
-            w.append(f"{c[rol]} in (" + ", ".join(f"'{esc(v)}'" for v in f[clave]) + ")")
+            base.append(f"{c[rol]} in (" + ", ".join(f"'{esc(v)}'" for v in f[clave]) + ")")
     for rol, clave in (("ciudad", "ciudad"), ("entidad", "entidad")):
         if f[clave] and rol in c:
-            w.append(contiene_palabras(c[rol], f[clave]))
+            base.append(contiene_palabras(c[rol], f[clave]))
     if f["proveedor"]:
         cols = [c[r] for r in ("proveedor", "nit") if r in c]
         if cols:
-            w.append("(" + " OR ".join(contiene_palabras(col, f["proveedor"]) for col in cols) + ")")
-    return " AND ".join(w)
+            base.append("(" + " OR ".join(contiene_palabras(col, f["proveedor"]) for col in cols) + ")")
+    if not alts:
+        return [" AND ".join(base)]
+    union = " AND " if f["todos"] else " OR "
+
+    def armar(grupo):
+        return " AND ".join(base + ["(" + union.join(grupo) + ")"])
+    if f["todos"] or max_url is None:
+        return [armar(alts)]
+    trozos, actual = [], []
+    for a in alts:
+        if actual and len(quote_plus(armar(actual + [a]))) > max_url:
+            trozos.append(actual)
+            actual = []
+        actual.append(a)
+    trozos.append(actual)
+    return [armar(t) for t in trozos]
+
+
+def construir_where(c, f):
+    return construir_wheres(c, f, max_url=None)[0]
 
 
 def traer(ds_id, select, where, order, limite):
@@ -288,18 +404,31 @@ def normalizar(df, c, tope):
 
 def ejecutar(ds, c, f, traer_fn=traer):
     """Consulta completa: construye el filtro, descarga, normaliza y aplica los filtros posteriores."""
-    where = construir_where(c, f)
+    wheres = construir_wheres(c, f)
     select = ",".join(dict.fromkeys(c.values()))
     order = f"{c['fecha']} DESC" if "fecha" in c else ""
-    total, crudo = traer_fn(ds["id"], select, where, order, f["limite"])
+    total, crudos = 0, []
+    for w in wheres:
+        t, crudo_i = traer_fn(ds["id"], select, w, order, f["limite"])
+        total += t
+        if not crudo_i.empty:
+            crudos.append(crudo_i)
+    crudo = pd.concat(crudos, ignore_index=True) if crudos else pd.DataFrame()
     df, ignorados = pd.DataFrame(), 0
     if not crudo.empty:
         df, ignorados = normalizar(crudo, c, f["tope"])
+        if len(wheres) > 1:  # una fila puede coincidir en varias consultas
+            df = df.drop_duplicates("clave")
+            total = len(df)
+        if f.get("excluir_local"):  # palabras a descartar DESPUÉS de bajar los datos (no alargan la consulta)
+            rx = "|".join(_rx(t) for t in f["excluir_local"])
+            df = df[~df["texto"].fillna("").str.upper().str.contains(rx, regex=True)]
         if f["solo_vigentes"] and "fecha_fin" in c:
             df = df[df["vigente"]]
         if f["valor_min"]:
             df = df[df["valor"].fillna(0) >= f["valor_min"]]
-    return dict(where=where, select=select, order=order, total=total, n_crudo=len(crudo), df=df, ignorados=ignorados)
+    return dict(where=wheres[0] if len(wheres) == 1 else f"-- {len(wheres)} consultas --\n" + "\n".join(wheres),
+                select=select, order=order, total=total, n_crudo=len(crudo), df=df, ignorados=ignorados)
 
 
 def partir(txt):
@@ -325,7 +454,7 @@ PERFIL:
 <<PERFIL>>
 
 Las búsquedas se hacen con LIKE '%palabra%' sobre el objeto del contrato (texto en mayúsculas), así que:
-- "terminos": de 12 a 25 palabras clave o raíces CORTAS en MAYÚSCULAS, tal como suelen aparecer en objetos contractuales (sinónimos, cargos, actividades, entidades afines). Usa raíces para cubrir variantes (AGRONOM cubre AGRÓNOMO y AGRONOMÍA). Reemplaza cada vocal con tilde y cada Ñ por "_" (AGR_COLA, DISE_O, INTERVENTOR_A). Evita palabras genéricas que traerían mucho ruido (APOYO, GESTION, SERVICIOS, PRESTACION).
+- "terminos": de 12 a 25 palabras clave o raíces CORTAS en MAYÚSCULAS, tal como suelen aparecer en objetos contractuales (sinónimos, cargos, actividades, entidades afines). Usa raíces para cubrir variantes (AGR_NOM cubre AGRÓNOMO, AGRONOMO y AGRONOMÍA). Reemplaza cada vocal con tilde y cada Ñ por "_" (AGR_COLA, DISE_O, INTERVENTOR_A). Evita palabras genéricas que traerían mucho ruido (APOYO, GESTION, SERVICIOS, PRESTACION).
 - "excluir": de 0 a 8 raíces de áreas claramente ajenas al perfil que suelan colarse en los resultados.
 - "departamentos": solo nombres EXACTOS de esta lista, y solo si el perfil menciona una ubicación; si no, lista vacía. Lista: <<DEPTOS>>
 - "ciudad": un municipio si el perfil menciona uno solo; si no, cadena vacía.
