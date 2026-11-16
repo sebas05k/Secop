@@ -190,6 +190,10 @@ def tarjeta(r, claves_seg, es_proceso, clave_widget):
                 datos.append(f"a {r.proveedor}")
             if pd.notna(r.fecha):
                 datos.append(f"firmado {fmt_fecha(r.fecha)}")
+            if pd.notna(r.fecha_fin):
+                datos.append(f"termina {fmt_fecha(r.fecha_fin)}")
+        if isinstance(r.codigo, str) and r.codigo:
+            datos.append(f"cód. {r.codigo}")
         st.caption(md(" · ".join(datos)))
         a, b = st.columns(2)
         if r.url:
@@ -250,6 +254,8 @@ def tarjetas(df, es_proceso, pref):
 def tabla_resultados(df, pref):
     cols = [x for x in ["proveedor", "entidad", "contrato", "departamento", "valor", "estado", "fecha", "fecha_fin", "texto", "url"]
             if df[x].notna().any()]
+    if df["codigo"].astype(str).str.len().gt(0).any():
+        cols.insert(cols.index("valor") + 1 if "valor" in cols else len(cols), "codigo")
     vista = df[cols].copy()
     vista.insert(0, "⭐", False)
     config = {
@@ -258,6 +264,7 @@ def tabla_resultados(df, pref):
         "entidad": st.column_config.TextColumn("Entidad"),
         "contrato": st.column_config.TextColumn("N.º contrato / proceso"),
         "valor": st.column_config.NumberColumn("Valor (COP)", format="$%d"),
+        "codigo": st.column_config.TextColumn("UNSPSC"),
         "fecha": st.column_config.DateColumn("Fecha", format="YYYY-MM-DD"),
         "fecha_fin": st.column_config.DateColumn("Fin / cierre", format="YYYY-MM-DD"),
         "texto": st.column_config.TextColumn("Descripción", width="large"),
@@ -326,14 +333,17 @@ def resultados(b):
             try:
                 validos = [d for d in b["deptos"] if d in opciones("departamento", ds, c)]
                 if b["deptos"] and not validos:
-                    notas[nombre] = "El departamento elegido no figura en este conjunto de datos, así que se muestra todo el país."
+                    notas.setdefault(nombre, []).append("El departamento elegido no figura en este conjunto de datos, así que se muestra todo el país.")
+                if b["codigos"] and "codigo" not in c:
+                    notas.setdefault(nombre, []).append("Este conjunto de datos no trae código UNSPSC, así que no se aplicó el filtro de área.")
                 estados = sc.estados_abiertos(opciones("estado", ds, c)) if es_proceso and b["solo_abiertas"] and "estado" in c else []
                 f = sc.filtros_base(
                     rapida=(b["modo"], b["valor"]) if b["valor"] else None, terminos=b["terminos"], excluir=b["excluir"],
                     deptos=validos, ciudad=b["ciudad"],
                     entidad=b["entidad"], proveedor=b["proveedor"], modalidades=b["modalidades"], tipos=b["tipos"],
                     estados=estados, desde=desde, hasta=str(hoy), solo_vigentes=es_proceso and b["solo_abiertas"],
-                    valor_min=b["valor_min"], limite=1000)
+                    valor_min=b["valor_min"], limite=1000,
+                    codigos=b["codigos"], modo_codigo="y" if b["codigos"] else "no")
                 with st.spinner(f"Buscando en {NOMBRE_SECCION[nombre]}…"):
                     salidas[nombre] = ("ok", sc.ejecutar(ds, c, f, traer))
             except Exception as e:
@@ -341,8 +351,8 @@ def resultados(b):
     etiquetas = [NOMBRE_SECCION[n] + (f" ({d['total']:,})" if e == "ok" else "") for n, (e, d) in salidas.items()]
     for tab, (nombre, (estado, dato)) in zip(st.tabs(etiquetas), salidas.items()):
         with tab:
-            if notas.get(nombre):
-                st.caption("⚠️ " + notas[nombre])
+            for nota in notas.get(nombre, []):
+                st.caption("⚠️ " + nota)
             if estado == "ok":
                 mostrar_resultados(dato, nombre == CONVOCATORIAS, PREFIJO[nombre], b["modo"] if b["valor"] else None)
             elif estado == "error":
@@ -398,24 +408,31 @@ def pagina_buscar():
         periodo = b_.selectbox("Periodo", list(PERIODOS), index=2,
                                help="Contratos: fecha de firma. Convocatorias: fecha de publicación. Para ver todo el historial de una empresa elige «Todo el historial».")
         solo_abiertas = b_.checkbox("Convocatorias: solo abiertas", value=True)
+        areas = st.multiselect("Área (código UNSPSC)", list(sc.AREAS_UNSPSC), format_func=sc.etiqueta_area,
+                               help="Cada contrato trae un código de 8 dígitos que dice de qué trata; los dos primeros son el sector. "
+                                    "Si eliges áreas, solo salen los registros cuyo código sea de esas áreas.")
         with st.expander("Más filtros"):
             m1, m2 = st.columns(2)
             valor_min = m1.number_input("Valor mínimo (COP)", min_value=0, value=0, step=10_000_000)
             ciudad = m1.text_input("Ciudad o municipio contiene")
             entidad = m2.text_input("Entidad contiene")
             proveedor = m2.text_input("Empresa, persona o NIT contiene")
+            codigos_extra = m1.text_input("Otros códigos UNSPSC", placeholder="ej: 70141600, 8010",
+                                          help="Códigos de 2 a 8 dígitos. Un código corto incluye todos los que empiezan igual.")
             modalidades = st.multiselect("Modalidad de contratación", opciones_union("modalidad"))
             tipos = st.multiselect("Tipo de contrato", opciones_union("tipo"))
         enviado = st.form_submit_button("🔎 Buscar", type="primary", width="stretch")
 
     if enviado:
         terminos = list(dict.fromkeys([k for s_ in sectores for k in sc.PLANTILLAS[s_]] + sc.partir(extra)))
+        codigos = sc.prefijos_codigo(areas, codigos_extra)
         partes = [f"{modo} «{valor}»" if valor else None, ", ".join(sectores) or None,
-                  f"palabras: {extra.strip()}" if extra.strip() else None, ", ".join(deptos) or None, periodo.lower()]
+                  f"palabras: {extra.strip()}" if extra.strip() else None, ", ".join(deptos) or None,
+                  f"códigos {'/'.join(codigos)}" if codigos else None, periodo.lower()]
         spec = dict(
             modo=modo, valor=valor, terminos=terminos, excluir=sc.partir(excluir), deptos=deptos, ciudad=ciudad.strip(),
             entidad=entidad.strip(), proveedor=proveedor.strip(), modalidades=modalidades, tipos=tipos, periodo=periodo,
-            solo_abiertas=solo_abiertas, valor_min=int(valor_min), resumen=" · ".join(p for p in partes if p))
+            solo_abiertas=solo_abiertas, valor_min=int(valor_min), codigos=codigos, resumen=" · ".join(p for p in partes if p))
         st.session_state["busq"] = {**spec, "id": repr(spec)}
     b = st.session_state.get("busq")
     if not b:
@@ -432,45 +449,87 @@ TIPOS_ALERTA = {
     "convocatorias": "🟢 Convocatorias abiertas (de cualquier modalidad)",
     "adjudicados": "🏆 Contratos recién adjudicados (licitaciones, concursos…)",
     "directos": "🤝 Contratos directos recientes (incluye prestación de servicios)",
+    "vencer": "⏳ Contratos por vencer (a la entidad se le acaba el contrato: puede necesitar reemplazo)",
+}
+MODOS_CODIGO = {
+    "y": "🎯 Estricto: el código debe ser de mis áreas Y debe aparecer una palabra de mi perfil",
+    "o": "⚖️ Amplio: sirve el código de mis áreas O las palabras (los códigos generales 80 y 81 no cuentan solos)",
+    "no": "🔤 Ignorar el código (solo palabras, como antes)",
 }
 
 
 def vista_previa(perfil, tipos):
     """Muestra lo que traería la alerta hoy con estos ajustes (no envía nada ni marca nada como visto)."""
     import alertas
-    secciones = []
+    secciones = []   # (título, DataFrame, ¿por vencer?)
     try:
         with st.spinner("Consultando datos.gov.co… (puede tardar un minuto)"):
             if "convocatorias" in tipos:
-                secciones.append(("🟢 Convocatorias abiertas", alertas.convocatorias_nuevas(perfil, set())))
+                secciones.append(("🟢 Convocatorias abiertas", alertas.convocatorias_nuevas(perfil, set()), False))
             if "adjudicados" in tipos or "directos" in tipos:
                 adj, dire = alertas.contratos_nuevos(perfil, set())
                 if "adjudicados" in tipos:
-                    secciones.append(("🏆 Contratos adjudicados", adj))
+                    secciones.append(("🏆 Contratos adjudicados", adj, False))
                 if "directos" in tipos:
-                    secciones.append(("🤝 Contratos directos", dire))
+                    secciones.append(("🤝 Contratos directos", dire, False))
+            if "vencer" in tipos:
+                secciones.append(("⏳ Contratos por vencer", alertas.contratos_por_vencer(perfil, set()), True))
     except Exception as e:
         st.error(f"No pude consultar: {e}")
         return
-    secciones = [(t, df) for t, df in secciones if not df.empty]
-    total = sum(len(df) for _, df in secciones)
+    secciones = [s for s in secciones if not s[1].empty]
+    total = sum(len(s[1]) for s in secciones)
     if not total:
-        st.info("Con estos ajustes hoy no llegaría nada. Si es demasiado estricto, agrega palabras al núcleo o combinaciones.")
+        st.info("Con estos ajustes hoy no llegaría nada. Si es demasiado estricto, agrega palabras al núcleo, usa el modo «Amplio» o añade más áreas.")
         return
     if total > 40:
-        st.warning(f"Hoy te llegarían {total} avisos: son muchos. Mira qué palabras traen más resultados y ajusta.")
+        st.warning(f"Hoy te llegarían {total} avisos: son muchos. Mira qué palabras y códigos traen más resultados y ajusta.")
     else:
         st.success(f"Hoy te llegarían {total} avisos.")
-    tabla = sc.conteo_por_palabra(pd.concat([df for _, df in secciones]), perfil.get("terminos", []), perfil.get("reglas", []))
+    todos = pd.concat([s[1] for s in secciones])
     with st.expander("Qué palabras y combinaciones traen más resultados"):
-        st.dataframe(tabla.head(25), hide_index=True)
+        st.dataframe(sc.conteo_por_palabra(todos, perfil.get("terminos", []), perfil.get("reglas", [])).head(25), hide_index=True)
         st.caption("Si una fila trae muchísimos resultados que no son de tu área, bórrala o hazla más específica.")
-    for titulo, df in secciones:
+    with st.expander("Qué códigos UNSPSC aparecen (para entender qué trae cada uno)"):
+        cods = sc.conteo_por_codigo(todos)
+        if cods.empty:
+            st.caption("No hay códigos en estos resultados (¿el dataset no trae la columna? Mira «Verificar columnas»).")
+        else:
+            st.dataframe(cods, hide_index=True)
+            st.caption("Los dos primeros dígitos son el sector. Si ves sectores que no son tuyos, quita esa área o usa el modo «Estricto».")
+    for titulo, df, vence in secciones:
         st.markdown(f"**{titulo}: {len(df)}**")
         for r in df.head(8).itertuples():
-            quien = f"{r.proveedor} · " if isinstance(r.proveedor, str) and r.proveedor else ""
+            if vence:
+                detalle = f" — termina {fmt_fecha(r.fecha_fin)} · {md(r.entidad or '')}"
+            else:
+                quien = f"{r.proveedor} · " if isinstance(r.proveedor, str) and r.proveedor else ""
+                detalle = f" — {md(quien)}{md(r.entidad or '')}"
             valor = f" · ${r.valor:,.0f}" if pd.notna(r.valor) else ""
-            st.markdown(f"- {md((r.texto or '')[:120])} — {md(quien)}{md(r.entidad or '')}{valor}")
+            cod = f" · cód. {r.codigo}" if isinstance(r.codigo, str) and r.codigo else ""
+            st.markdown(f"- {md((r.texto or '')[:120])}{detalle}{valor}{cod}")
+
+
+def diagnostico():
+    """Qué columna se asignó a cada dato en cada conjunto de datos (sobre todo la del código UNSPSC y la de fin del contrato)."""
+    with st.expander("🔧 Verificar columnas (si algo no funciona, empieza aquí)"):
+        for nombre, ds in sc.DATASETS.items():
+            c, err = columnas_de(ds)
+            st.markdown(f"**{nombre}** · `{ds['id']}`")
+            if err:
+                st.warning(err)
+                continue
+            clave = {r: c.get(r, "— no encontrada —") for r in ("codigo", "fecha", "fecha_fin", "modalidad", "valor", "estado")}
+            st.dataframe(pd.DataFrame({"dato": list(clave), "columna": list(clave.values())}), hide_index=True)
+            if "codigo" in c:
+                try:
+                    muestra = sc.api(ds["id"], {"$select": c["codigo"], "$limit": 5, "$where": f"{c['codigo']} IS NOT NULL"})
+                    st.caption("Ejemplos del código: " + ", ".join(str(m.get(c["codigo"])) for m in muestra))
+                except Exception as e:
+                    st.caption(f"No pude leer ejemplos del código: {str(e)[:150]}")
+            else:
+                st.warning("No encontré la columna del código UNSPSC: el filtro por código no se aplica en este conjunto de datos. "
+                           "Busca en datos.gov.co el nombre de la columna y agrégalo a DATASETS (rol «codigo») en secop_core.py.")
 
 
 def ajustes_alertas():
@@ -504,8 +563,13 @@ def ajustes_alertas():
                         st.rerun()
         tipos = st.multiselect("Qué quieres que te avise", list(TIPOS_ALERTA), format_func=TIPOS_ALERTA.get, key=f"al_tip_{v}",
                                default=[t for t in perfil.get("alertas_tipos", list(TIPOS_ALERTA)) if t in TIPOS_ALERTA])
-        vmin = st.number_input("Valor mínimo de los contratos (COP), para evitar contratos pequeños", min_value=0, step=10_000_000,
-                               value=int(perfil.get("valor_min_contratos") or 0), key=f"al_vmin_{v}")
+        k1, k2 = st.columns(2)
+        vmin = k1.number_input("Valor mínimo de los contratos (COP)", min_value=0, step=10_000_000,
+                               value=int(perfil.get("valor_min_contratos") or 0), key=f"al_vmin_{v}",
+                               help="Para evitar contratos pequeños. Déjalo en 0 si buscas prestación de servicios.")
+        dias_vencer = k2.number_input("Contratos por vencer: avisar cuando falten hasta (días)", min_value=7, max_value=180,
+                                      value=int(perfil.get("dias_vencer") or 45), key=f"al_dv_{v}",
+                                      help="Se avisa una sola vez por contrato, cuando entra en esta ventana.")
         st.markdown("**🎯 Palabras que bastan solas** (una por línea)")
         nucleo = st.text_area("Núcleo", height=190, key=f"al_nuc_{v}", label_visibility="collapsed",
                               value=perfil.get("nucleo", "\n".join(sc.NUCLEO_AGRONOMO)))
@@ -515,6 +579,30 @@ def ajustes_alertas():
                    "Usa «_» en lugar de una vocal con tilde.")
         combos = st.text_area("Combinaciones", height=190, key=f"al_cmb_{v}", label_visibility="collapsed",
                               value=perfil.get("combos", sc.COMBOS_AGRONOMO))
+
+        st.markdown("**🏷️ Código UNSPSC** (recomendado)")
+        st.caption("Cada contrato y cada convocatoria trae un código de 8 dígitos que dice **de qué trata**. Los dos primeros son el sector: "
+                   "**70** = servicios agrícolas, pecuarios y forestales · **77** = ambientales · **80** = servicios profesionales y de gestión "
+                   "(el que usan casi todos los contratos por prestación de servicios) · **21 10** = maquinaria agrícola. "
+                   "Del 10 al 60 son bienes (cosas que se compran); del 70 al 94, servicios. "
+                   "Como los contratos por prestación de servicios casi siempre llevan un código genérico (80), "
+                   "el código se **combina con las palabras**: el código descarta lo que no es de tu sector y las palabras confirman el tema.")
+        areas_prev = perfil.get("codigos_areas") if "codigos_areas" in perfil else sc.AREAS_AGRO_DEFECTO
+        areas = st.multiselect("Áreas de mi sector", list(sc.AREAS_UNSPSC), format_func=sc.etiqueta_area, key=f"al_areas_{v}",
+                               default=[a for a in areas_prev if a in sc.AREAS_UNSPSC])
+        codigos_extra = st.text_input("Otros códigos (opcional)", value=perfil.get("codigos_extra", ""), key=f"al_cex_{v}",
+                                      placeholder="ej: 70141600, 7714",
+                                      help="De 2 a 8 dígitos; uno corto incluye todos los que empiezan igual. "
+                                           "Búscalos en el clasificador oficial: https://operaciones.colombiacompra.gov.co/clasificador-de-bienes-y-servicios")
+        modo_cod = st.radio("Cómo usar el código", list(MODOS_CODIGO), format_func=MODOS_CODIGO.get, key=f"al_mcod_{v}",
+                            index=list(MODOS_CODIGO).index(perfil.get("modo_codigo", "y")) if perfil.get("modo_codigo", "y") in MODOS_CODIGO else 0)
+        codigos = sc.prefijos_codigo(areas, codigos_extra)
+        if modo_cod != "no" and not codigos:
+            st.warning("Elegiste usar el código pero no hay áreas ni códigos: no se aplicará.")
+        if c and "codigo" not in c:
+            st.warning("No encontré la columna del código UNSPSC en el conjunto de datos de contratos: el filtro no se aplicará. "
+                       "Abre «Verificar columnas» más abajo.")
+
         sectores = st.multiselect("Sectores completos (opcional; traen más ruido)", list(sc.PLANTILLAS), key=f"al_sec_{v}",
                                   default=[s_ for s_ in perfil.get("sectores", []) if s_ in sc.PLANTILLAS])
         excluir = st.text_input("Excluir palabras", key=f"al_exc_{v}",
@@ -531,10 +619,15 @@ def ajustes_alertas():
         sueltas = [ln.strip() for ln in combos.splitlines() if ln.strip() and not sc.texto_a_reglas(ln)]
         if sueltas:
             st.warning("Estas líneas de combinaciones no tienen «+» y se ignoran: " + " · ".join(sueltas[:3]))
+
+        def ajustes():
+            return dict(terminos=terminos, reglas=reglas, excluir=sc.partir(excluir), deptos=deptos,
+                        valor_min_contratos=int(vmin), quitar_ruido=ruido, codigos=codigos, modo_codigo=modo_cod,
+                        dias_vencer=int(dias_vencer))
+
         if st.button("👀 Ver qué traería hoy", width="stretch", key="al_prev"):
             if terminos or reglas:
-                vista_previa(dict(terminos=terminos, reglas=reglas, excluir=sc.partir(excluir), deptos=deptos,
-                                  valor_min_contratos=int(vmin), quitar_ruido=ruido), tipos or list(TIPOS_ALERTA))
+                vista_previa(ajustes(), tipos or list(TIPOS_ALERTA))
             else:
                 st.warning("Escribe al menos una palabra o una combinación.")
         if st.button("💾 Guardar alertas", type="primary", width="stretch"):
@@ -543,15 +636,15 @@ def ajustes_alertas():
             elif not tipos:
                 st.warning("Elige al menos un tipo de aviso.")
             else:
-                persistir_perfil(dict(terminos=terminos, reglas=reglas, nucleo=nucleo.strip(), combos=combos.strip(),
-                                      excluir=sc.partir(excluir), deptos=deptos, sectores=sectores, alertas_tipos=tipos,
-                                      valor_min_contratos=int(vmin), quitar_ruido=ruido))
+                persistir_perfil(dict(**ajustes(), nucleo=nucleo.strip(), combos=combos.strip(), sectores=sectores,
+                                      alertas_tipos=tipos, codigos_areas=areas, codigos_extra=codigos_extra.strip()))
                 st.success("Alertas guardadas ✅" if ALM else "Guardado solo en esta sesión. Configura Google Sheets para que las alertas lo lean.")
 
 
 def pagina_guardados():
     pagina_seguimiento()
     ajustes_alertas()
+    diagnostico()
 
 
 # ---------------------------------------------------------------------------
