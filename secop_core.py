@@ -51,7 +51,6 @@ DATASETS = {
             "contrato": ["id_contrato", "referencia_del_contrato"],
             "proceso": ["proceso_de_compra"],
             "representante": ["nombre_representante_legal"],
-            "codigo": ["codigo_de_categoria_principal"],   # ← de memoria; la app lo detecta (ver Diagnóstico)
         },
     },
     "🟢 Convocatorias (procesos)": {
@@ -73,7 +72,6 @@ DATASETS = {
             "nit": ["nit_del_proveedor_adjudicado"],
             "url": ["urlproceso"],
             "contrato": ["id_del_proceso", "referencia_del_proceso"],
-            "codigo": ["codigo_principal_de_categoria"],   # ← de memoria; la app lo detecta (ver Diagnóstico)
         },
     },
 }
@@ -84,11 +82,10 @@ PISTAS = {
     "descripcion": r"descrip|objeto", "estado": r"^estado", "modalidad": r"modalidad",
     "valor": r"^valor|precio", "fecha": r"fecha.*(firma|publica)", "proveedor": r"proveedor|contratista",
     "nit": r"nit|documento", "url": r"^url",
-    "codigo": r"categor.*principal|principal.*categor|unspsc",
 }
 ROLES = ["entidad", "departamento", "ciudad", "titulo", "descripcion", "estado", "modalidad",
          "tipo", "valor", "fecha", "fecha_fin", "proveedor", "nit", "url",
-         "contrato", "proceso", "representante", "codigo"]
+         "contrato", "proceso", "representante"]
 BUSQUEDA = {"descripcion": ("titulo", "descripcion"), "entidad": ("entidad",), "proveedor": ("proveedor",)}
 
 # Modos de la búsqueda directa (con autocompletado)
@@ -176,92 +173,6 @@ def contiene(col, texto):
 
 
 # ---------------------------------------------------------------------------
-# Código UNSPSC: cada contrato o proceso trae un código de 8 dígitos que dice DE QUÉ TRATA.
-#   · los 2 primeros dígitos son el sector (segmento): 70 = servicios agrícolas, pecuarios y forestales
-#   · los 4 primeros, la familia; los 6 primeros, la clase
-#   · segmentos 10 a 60 = bienes (cosas que se compran); 70 a 94 = servicios
-# Sirve para quedarse solo con lo del sector y descartar lo demás. Límite: los contratos por prestación de servicios
-# casi siempre llevan un código genérico (80...), por eso el código se combina con las palabras clave.
-# ---------------------------------------------------------------------------
-SEGMENTOS = {
-    "10": "Material vivo vegetal y animal (semillas, plantas, animales)",
-    "21": "Maquinaria y accesorios para agricultura, pesca y silvicultura",
-    "70": "Servicios agrícolas, pesqueros, forestales y de fauna",
-    "72": "Servicios de construcción y mantenimiento de edificaciones",
-    "73": "Servicios de producción industrial y manufactura",
-    "76": "Servicios de limpieza industrial",
-    "77": "Servicios medioambientales",
-    "78": "Servicios de transporte, almacenaje y correo",
-    "80": "Servicios de gestión, profesionales y administrativos",
-    "81": "Servicios de ingeniería, investigación y tecnología",
-    "82": "Servicios editoriales, de diseño y artes gráficas",
-    "83": "Servicios públicos y del sector público",
-    "84": "Servicios financieros y de seguros",
-    "85": "Servicios de salud",
-    "86": "Servicios educativos y de formación",
-    "90": "Servicios de viajes, alimentación y entretenimiento",
-    "92": "Servicios de seguridad, defensa y orden público",
-    "93": "Servicios políticos y de asuntos cívicos",
-    "94": "Organizaciones y clubes",
-    "95": "Terrenos, edificios, estructuras y vías",
-}
-
-# Áreas en lenguaje simple → prefijos de código. Los de GENÉRICOS no sirven solos: solo cuentan junto a palabras clave.
-AREAS_UNSPSC = {
-    "🌾 Servicios agrícolas, pecuarios y forestales": ["70"],
-    "🌳 Servicios ambientales": ["77"],
-    "👷 Servicios profesionales y de gestión (casi todos los contratos por prestación de servicios)": ["80"],
-    "🔬 Ingeniería, investigación y tecnología": ["81"],
-    "🌱 Semillas, plantas y animales vivos (bienes)": ["10"],
-    "🚜 Maquinaria agrícola (bienes)": ["2110"],
-}
-AREAS_AGRO_DEFECTO = list(AREAS_UNSPSC)[:3]
-CODIGOS_GENERICOS = ("80", "81")
-
-
-def etiqueta_area(area):
-    return f"{area} · {' / '.join(AREAS_UNSPSC[area])}"
-
-
-def prefijos_codigo(areas, extra=""):
-    """Áreas elegidas + códigos escritos a mano (2 a 8 dígitos, con o sin 'V1.') → lista de prefijos sin repetir."""
-    pref = [p for a in (areas or []) for p in AREAS_UNSPSC.get(a, [])]
-    for t in re.split(r"[,;\s]+", extra or ""):
-        m = re.fullmatch(r"(?:V\d+\.)?(\d{2,8})", t.strip(), re.I)
-        if m:
-            pref.append(m.group(1))
-    return list(dict.fromkeys(pref))
-
-
-def limpiar_codigo(v):
-    """'V1.80111600' → '80111600' (8 dígitos); vacío si no hay código."""
-    if not isinstance(v, str):
-        return ""
-    m = re.search(r"(?:^|\D)(\d{6,10})(?:\D|$)", v)
-    return m.group(1)[:8] if m else ""
-
-
-def clausula_codigo(col, prefijos):
-    """Filtro SoQL: el código empieza por alguno de los prefijos (acepta con y sin el 'V1.' delante)."""
-    return "(" + " OR ".join(f"{col} like 'V_.{p}%' OR {col} like '{p}%'" for p in prefijos) + ")"
-
-
-def conteo_por_codigo(df, top=15):
-    """Qué códigos aparecen más en los resultados (para que se entienda qué trae cada uno)."""
-    vacio = pd.DataFrame(columns=["código", "sector", "resultados"])
-    if df.empty or "codigo" not in df:
-        return vacio
-    cod = df["codigo"].fillna("")
-    cod = cod[cod != ""]
-    if cod.empty:
-        return vacio
-    t = cod.value_counts().head(top).reset_index()
-    t.columns = ["código", "resultados"]
-    t["sector"] = t["código"].str[:2].map(SEGMENTOS).fillna("")
-    return t[["código", "sector", "resultados"]]
-
-
-# ---------------------------------------------------------------------------
 # Perfil restrictivo: "núcleo" (palabras que bastan solas) + "combinaciones" (A + B: deben aparecer ambas)
 # Las palabras generales (apoyo, profesional, supervisor, UARIV, QGIS...) NO bastan solas: solo cuentan junto a un tema agro.
 # ---------------------------------------------------------------------------
@@ -269,8 +180,6 @@ NUCLEO_AGRONOMO = [
     "AGR_NOM", "AGROPECUARI", "AGROECOL", "AGROFORESTAL", "FITOSANIT", "FITOPATOL", "SANIDAD VEGETAL",
     "EXTENSI_N AGROPECUARIA", "EXTENSI_N RURAL", "UMATA", "ASISTENCIA T_CNICA RURAL", "PROYECTOS PRODUCTIVOS",
     "AGRICULTURA CAMPESINA", "AGRICULTURA FAMILIAR", "HUERTA", "HORTALIZA",
-    "AGROINDUSTRIAL", "PRODUCCI_N AGR_COLA", "BUENAS PR_CTICAS AGR_COLAS", "MANEJO INTEGRADO DE PLAGAS",
-    "FERTILIDAD DE SUELOS", "AGRICULTURA SOSTENIBLE", "AGRICULTURA DE PRECISI_N",
 ]
 COMBOS_AGRONOMO = """DESARROLLO RURAL + ASISTENCIA T_CNICA | EXTENSI_N | PRODUCTIV | AGRO | CULTIV
 AGR_COLA + PROFESIONAL | T_CNIC | ASISTENCIA | APOYO | SUPERVIS | EXTENSI_N
@@ -280,9 +189,7 @@ SUPERVIS + AGRO | AGR_COLA | PRODUCTIV | RURAL
 UARIV | V_CTIMAS + PRODUCTIV | RURAL | AGRO | AGR_COLA | HUERTA
 SOBERAN_A ALIMENTARIA | SEGURIDAD ALIMENTARIA + RURAL | CAMPESIN | PRODUCTIV | HUERTA | AGRO
 QGIS | GEORREFERENC | CARTOGRAF | INFORMACI_N GEOGR_FICA + AGRO | AGR_COLA | RURAL | CULTIV
-AN_LISIS DE DATOS + AGRO | AGR_COLA | RURAL | CULTIV
-SUELO | SUELOS + AGR_COLA | AGRO | CULTIV | FERTILIDAD | PRODUCTIV
-RIEGO + AGR_COLA | AGRO | CULTIV | PRODUCTIV | RURAL"""
+AN_LISIS DE DATOS + AGRO | AGR_COLA | RURAL | CULTIV"""
 EXCLUIR_AGRONOMO = ["RACIONES", "COMBUSTIBLE"]
 PLANTILLAS["🎯 Ingeniería agronómica (estricta)"] = NUCLEO_AGRONOMO
 
@@ -332,18 +239,14 @@ def _coincide_regla(textos, regla):
     return ok
 
 
-def puntaje(df, terminos, reglas=(), codigos=()):
-    """Relevancia de cada fila: 2 puntos por palabra del núcleo, 1 por combinación cumplida y 2 si el código es de tu sector
-    (los códigos genéricos 80 y 81 no suman). Sirve para ordenar."""
+def puntaje(df, terminos, reglas=()):
+    """Relevancia de cada fila: 2 puntos por palabra del núcleo y 1 por combinación cumplida (para ordenar)."""
     textos = df["texto"].fillna("").str.upper()
     p = pd.Series(0, index=df.index)
     for t in terminos:
         p += 2 * textos.str.contains(_rx(t), regex=True).astype(int)
     for r in reglas:
         p += _coincide_regla(textos, r).astype(int)
-    esp = tuple(str(x) for x in (codigos or []) if not str(x).startswith(CODIGOS_GENERICOS))
-    if esp and "codigo" in df:
-        p += 2 * df["codigo"].fillna("").str.startswith(esp).astype(int)
     return p
 
 
@@ -385,14 +288,11 @@ def sugerir(ds_id, cols, texto):
 
 
 def filtros_base(**kw):
-    """Filtros con todos los campos en su valor neutro; se sobreescribe lo que haga falta.
-    Claves opcionales: reglas, excluir_local, codigos + modo_codigo ('y' | 'o' | 'no'),
-    fin_desde / fin_hasta (rango de fecha de fin del contrato) y orden (('fecha_fin', 'ASC'))."""
+    """Filtros con todos los campos en su valor neutro; se sobreescribe lo que haga falta."""
     hoy = date.today()
     f = dict(rapida=None, terminos=[], todos=False, excluir=[], buscar_en=["descripcion"], deptos=[],
              ciudad="", desde=str(hoy - timedelta(days=90)), hasta=str(hoy), estados=[], modalidades=[],
-             tipos=[], entidad="", proveedor="", solo_vigentes=False, valor_min=0, tope=10**12, limite=2000,
-             codigos=[], modo_codigo="no", fin_desde=None, fin_hasta=None, orden=None)
+             tipos=[], entidad="", proveedor="", solo_vigentes=False, valor_min=0, tope=10**12, limite=2000)
     f.update(kw)
     return f
 
@@ -407,11 +307,6 @@ def construir_wheres(c, f, max_url=MAX_URL):
     if "fecha" in c:
         base.append(f"{c['fecha']} >= '{f['desde']}T00:00:00'")
         base.append(f"{c['fecha']} <= '{f['hasta']}T23:59:59'")
-    if "fecha_fin" in c:  # rango de fin del contrato (para "contratos por vencer")
-        if f.get("fin_desde"):
-            base.append(f"{c['fecha_fin']} >= '{f['fin_desde']}T00:00:00'")
-        if f.get("fin_hasta"):
-            base.append(f"{c['fecha_fin']} <= '{f['fin_hasta']}T23:59:59'")
     if f.get("rapida"):  # nombre elegido en la barra (empresa/persona, entidad o contrato); se suma a los demás filtros
         modo, valor = f["rapida"]
         cols = [c[r] for r in MODOS[modo] if r in c]
@@ -426,17 +321,6 @@ def construir_wheres(c, f, max_url=MAX_URL):
         alts = [en_cols(t) for t in f["terminos"]]
         for regla in reglas:  # cada grupo es un OR de alternativas; los grupos de una regla se unen con AND
             alts.append("(" + " AND ".join("(" + " OR ".join(en_cols(x) for x in g) + ")" for g in regla) + ")")
-    # Código UNSPSC: 'y' = además de las palabras el código debe ser de tus áreas; 'o' = sirve el código O las palabras
-    # (en 'o' los códigos genéricos 80 y 81 no cuentan solos); 'no' = se ignora
-    pref = [p for p in (re.sub(r"\D", "", str(x)) for x in (f.get("codigos") or [])) if p]
-    modo_cod = f.get("modo_codigo", "no")
-    if "codigo" in c and pref:
-        if modo_cod == "y":
-            base.append(clausula_codigo(c["codigo"], pref))
-        elif modo_cod == "o":
-            esp = [p for p in pref if not p.startswith(CODIGOS_GENERICOS)]
-            if esp:
-                alts.append(clausula_codigo(c["codigo"], esp))
     for t in f["excluir"]:
         base += [f"upper({col}) not like '{patron(t)}'" for col in cols_busq]
     for rol, clave in (("departamento", "deptos"), ("estado", "estados"), ("modalidad", "modalidades"), ("tipo", "tipos")):
@@ -507,7 +391,6 @@ def clave_registro(url, contrato, entidad, texto):
 def normalizar(df, c, tope):
     out = pd.DataFrame({r: (df[c[r]] if r in c and c[r] in df.columns else None) for r in ROLES}, index=df.index)
     out["url"] = out["url"].map(lambda v: v.get("url", "") if isinstance(v, dict) else (v if isinstance(v, str) else ""))
-    out["codigo"] = out["codigo"].map(limpiar_codigo)
     out["valor"] = pd.to_numeric(out["valor"], errors="coerce")
     ignorados = int((out["valor"] > tope).sum())
     out["valor"] = out["valor"].where(out["valor"] <= tope)
@@ -523,11 +406,7 @@ def ejecutar(ds, c, f, traer_fn=traer):
     """Consulta completa: construye el filtro, descarga, normaliza y aplica los filtros posteriores."""
     wheres = construir_wheres(c, f)
     select = ",".join(dict.fromkeys(c.values()))
-    orden = f.get("orden")
-    if orden and orden[0] in c:
-        order = f"{c[orden[0]]} {orden[1]}"
-    else:
-        order = f"{c['fecha']} DESC" if "fecha" in c else ""
+    order = f"{c['fecha']} DESC" if "fecha" in c else ""
     total, crudos = 0, []
     for w in wheres:
         t, crudo_i = traer_fn(ds["id"], select, w, order, f["limite"])
