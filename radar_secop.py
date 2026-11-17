@@ -13,6 +13,7 @@ import re
 from datetime import date, timedelta
 
 import pandas as pd
+import requests
 import streamlit as st
 
 import secop_core as sc
@@ -435,6 +436,25 @@ TIPOS_ALERTA = {
 }
 
 
+def disparar_alerta():
+    """Lanza el workflow de alertas en GitHub (equivale a Actions → Run workflow). Devuelve (ok, motivo)."""
+    token, repo = secreto("GITHUB_TOKEN"), secreto("GITHUB_REPO")
+    wf, rama = secreto("GITHUB_WORKFLOW", "alertas.yml"), secreto("GITHUB_BRANCH", "main")
+    try:
+        r = requests.post(f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
+                          headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                                   "X-GitHub-Api-Version": "2022-11-28"}, json={"ref": rama}, timeout=20)
+    except requests.exceptions.RequestException as e:
+        return False, f"No pude conectar con GitHub: {e}"
+    if r.status_code == 204:
+        return True, ""
+    causas = {401: "El token no es válido o ya venció.",
+              403: "El token no tiene el permiso «Actions: Read and write» sobre este repositorio.",
+              404: "No encontré el repositorio o el workflow. Revisa GITHUB_REPO (usuario/repositorio) y GITHUB_WORKFLOW.",
+              422: f"GitHub no pudo lanzarlo desde la rama «{rama}». Revisa GITHUB_BRANCH (¿main o master?)."}
+    return False, f"{causas.get(r.status_code, f'GitHub respondió {r.status_code}.')} ({r.text[:120]})"
+
+
 def vista_previa(perfil, tipos):
     """Muestra lo que traería la alerta hoy con estos ajustes (no envía nada ni marca nada como visto)."""
     import alertas
@@ -465,6 +485,14 @@ def vista_previa(perfil, tipos):
     with st.expander("Qué palabras y combinaciones traen más resultados"):
         st.dataframe(tabla.head(25), hide_index=True)
         st.caption("Si una fila trae muchísimos resultados que no son de tu área, bórrala o hazla más específica.")
+    cod = sc.conteo_codigos(pd.concat([df for _, df in secciones]))
+    with st.expander("Códigos UNSPSC que aparecen en tus resultados"):
+        if cod.empty:
+            st.caption("No pude leer el código UNSPSC en estos datos (la columna no apareció).")
+        else:
+            st.dataframe(cod, hide_index=True)
+            st.caption("Los que empiezan por 70 son servicios agrícolas, pesqueros y forestales. Si ves otros códigos de tu área, "
+                       "agrégalos en «Códigos UNSPSC de tu interés».")
     for titulo, df in secciones:
         st.markdown(f"**{titulo}: {len(df)}**")
         for r in df.head(8).itertuples():
@@ -519,12 +547,25 @@ def ajustes_alertas():
                                   default=[s_ for s_ in perfil.get("sectores", []) if s_ in sc.PLANTILLAS])
         excluir = st.text_input("Excluir palabras", key=f"al_exc_{v}",
                                 value=", ".join(perfil.get("excluir", []) if estricto else sc.EXCLUIR_AGRONOMO))
+        excluir_ent = st.text_input("Excluir entidades (si su nombre contiene…)", key=f"al_ent_{v}",
+                                    value=", ".join(perfil.get("excluir_entidades", sc.ENTIDADES_RUIDO)),
+                                    help="Hospitales, policía, etc.: se descartan sin importar de qué hable el contrato.")
+        codigos_txt = st.text_input("Códigos UNSPSC de tu interés (opcional)", key=f"al_cod_{v}",
+                                    value=", ".join(perfil.get("codigos", ["70"])),
+                                    help="Es el código con que la entidad clasifica el contrato en SECOP. «70» = servicios agrícolas, "
+                                         "pesqueros y forestales. Pon prefijos separados por coma.")
+        codigos_modo = st.radio("Con esos códigos…", ["priorizar", "exigir"], horizontal=True, key=f"al_codm_{v}",
+                                index=["priorizar", "exigir"].index(perfil.get("codigos_modo", "priorizar")),
+                                format_func={"priorizar": "Que salgan primero (los demás también llegan)",
+                                             "exigir": "Exigirlos (solo llegan esos)"}.get)
         deptos = st.multiselect("Departamentos (vacío = todos)", opts_depto, key=f"al_dp_{v}",
                                 default=[d for d in perfil.get("deptos", []) if d in opts_depto])
         ruido = st.checkbox("Quitar ruido típico (médicos, abogados, deportes, eventos, aseo…)", key=f"al_ruido_{v}",
                             value=bool(perfil.get("quitar_ruido", True)))
         terminos = list(dict.fromkeys([k for s_ in sectores for k in sc.PLANTILLAS[s_]] + sc.partir(nucleo)))
         reglas = sc.texto_a_reglas(combos)
+        codigos = [d for d in (re.sub(r"\D", "", x) for x in sc.partir(codigos_txt)) if d]
+        extra_filtros = dict(excluir_entidades=sc.partir(excluir_ent), codigos=codigos, codigos_modo=codigos_modo)
         malas = sc.palabras_genericas(terminos)
         if malas:
             st.warning("Estas palabras son demasiado generales y traen mucho ruido; mejor pásalas a una combinación: " + ", ".join(malas))
@@ -534,7 +575,7 @@ def ajustes_alertas():
         if st.button("👀 Ver qué traería hoy", width="stretch", key="al_prev"):
             if terminos or reglas:
                 vista_previa(dict(terminos=terminos, reglas=reglas, excluir=sc.partir(excluir), deptos=deptos,
-                                  valor_min_contratos=int(vmin), quitar_ruido=ruido), tipos or list(TIPOS_ALERTA))
+                                  valor_min_contratos=int(vmin), quitar_ruido=ruido, **extra_filtros), tipos or list(TIPOS_ALERTA))
             else:
                 st.warning("Escribe al menos una palabra o una combinación.")
         if st.button("💾 Guardar alertas", type="primary", width="stretch"):
@@ -545,8 +586,22 @@ def ajustes_alertas():
             else:
                 persistir_perfil(dict(terminos=terminos, reglas=reglas, nucleo=nucleo.strip(), combos=combos.strip(),
                                       excluir=sc.partir(excluir), deptos=deptos, sectores=sectores, alertas_tipos=tipos,
-                                      valor_min_contratos=int(vmin), quitar_ruido=ruido))
+                                      valor_min_contratos=int(vmin), quitar_ruido=ruido, **extra_filtros))
                 st.success("Alertas guardadas ✅" if ALM else "Guardado solo en esta sesión. Configura Google Sheets para que las alertas lo lean.")
+        st.divider()
+        if secreto("GITHUB_TOKEN") and secreto("GITHUB_REPO"):
+            if st.button("▶️ Correr la alerta ahora", width="stretch", key="al_correr"):
+                ok, motivo = disparar_alerta()
+                if ok:
+                    st.success("Alerta lanzada ✅. En 1 o 2 minutos te llega por Telegram si hay novedades. "
+                               "Usa lo último que guardaste con «Guardar alertas».")
+                    st.link_button("Ver la ejecución en GitHub", f"https://github.com/{secreto('GITHUB_REPO')}/actions/workflows/"
+                                   f"{secreto('GITHUB_WORKFLOW', 'alertas.yml')}")
+                else:
+                    st.error(motivo)
+        else:
+            st.caption("▶️ Para activar el botón «Correr la alerta ahora», agrega en los secretos de Streamlit: GITHUB_TOKEN "
+                       "(permiso «Actions: Read and write» solo sobre tu repositorio) y GITHUB_REPO (usuario/repositorio).")
 
 
 def pagina_guardados():
