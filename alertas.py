@@ -30,7 +30,6 @@ from almacen import Almacen
 DIAS = int(os.environ.get("ALERTA_DIAS", "3"))                      # convocatorias publicadas en los últimos N días
 DIAS_CONTRATOS = int(os.environ.get("ALERTA_DIAS_CONTRATOS", "7"))  # contratos firmados en los últimos N días
 MAXIMO = int(os.environ.get("ALERTA_MAX", "25"))                    # máximo de avisos por sección
-VERSION_ESPERADA = "2026-11-17.2"
 TIPOS = ("convocatorias", "adjudicados", "directos")
 CONVOCATORIAS = "🟢 Convocatorias (procesos)"
 CONTRATOS = "📜 Contratos (ya firmados)"
@@ -82,38 +81,9 @@ def correo(usuario, clave, destino, asunto, cuerpo):
         s.send_message(msg)
 
 
-def avisar(encabezado, items, estricto=False):
-    """Envía por Telegram y/o correo lo que esté configurado. Devuelve True si salió por algún canal.
-    Con estricto=False nunca lanza error (se usa para avisar de fallos y de «sin novedades»)."""
-    enviado = False
-    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if token and chat:
-        try:
-            telegram(token, chat, en_bloques(encabezado, items))
-            enviado = True
-        except Exception as e:
-            if estricto:
-                raise
-            print(f"⚠️ No pude enviar por Telegram: {e}")
-    user, pwd, destino = os.environ.get("SMTP_USER"), os.environ.get("SMTP_PASS"), os.environ.get("EMAIL_TO")
-    if user and pwd and destino:
-        try:
-            correo(user, pwd, destino, encabezado, "\n\n".join(items))
-            enviado = True
-        except Exception as e:
-            if estricto:
-                raise
-            print(f"⚠️ No pude enviar por correo: {e}")
-    return enviado
-
-
 def filtros_perfil(perfil, desde, **extra):
     hoy = date.today()
-    excluir = list(perfil.get("excluir", [])) + (sc.RUIDO_TIPICO if perfil.get("quitar_ruido", True) else [])
-    return sc.filtros_base(terminos=perfil.get("terminos", []), reglas=perfil.get("reglas", []), excluir_local=excluir,
-                           excluir_entidades=perfil.get("excluir_entidades", sc.ENTIDADES_RUIDO),
-                           codigos=perfil.get("codigos", []), codigos_modo=perfil.get("codigos_modo", "priorizar"),
-                           deptos=perfil.get("deptos", []),
+    return sc.filtros_base(terminos=perfil["terminos"], excluir=perfil.get("excluir", []), deptos=perfil.get("deptos", []),
                            ciudad=perfil.get("ciudad", ""), desde=str(desde), hasta=str(hoy), limite=500, **extra)
 
 
@@ -141,25 +111,19 @@ def contratos_nuevos(perfil, ya):
     print(f"Contratos: {res['total']} coincidencias en el portal, {len(df)} tras filtros.")
     if df.empty:
         return df, df
-    df = df[~df["clave"].isin(ya)].drop_duplicates("clave")
-    # primero lo que más se parece a tu perfil (más palabras del núcleo), y a igual relevancia lo de mayor valor
-    df = df.assign(_rel=sc.puntaje(df, perfil.get("terminos", []), perfil.get("reglas", []), perfil.get("codigos", []))).sort_values(
-        ["_rel", "valor"], ascending=False)
+    df = df[~df["clave"].isin(ya)].drop_duplicates("clave").sort_values("valor", ascending=False)
     directos = df["modalidad"].fillna("").str.contains("directa", case=False)
     return df[~directos], df[directos]
 
 
 def main():
-    if getattr(sc, "VERSION", "") != VERSION_ESPERADA:
-        sys.exit("Los archivos no son de la misma versión: en GitHub reemplaza secop_core.py, alertas.py y radar_secop.py "
-                 f"por los últimos (secop_core.py es «{getattr(sc, 'VERSION', 'antigua')}», se esperaba «{VERSION_ESPERADA}»).")
     sheet_id, cred = os.environ.get("SHEET_ID"), os.environ.get("GCP_SERVICE_ACCOUNT")
     if not (sheet_id and cred):
         sys.exit("Faltan los secretos SHEET_ID y GCP_SERVICE_ACCOUNT.")
     alm = Almacen(json.loads(cred), sheet_id)
 
     perfil = alm.leer_perfil()
-    if not (perfil.get("terminos") or perfil.get("reglas")):
+    if not perfil.get("terminos"):
         print("Tu perfil aún no tiene palabras clave. Defínelas en la app (pestaña Guardados → Alertas) y guárdalas.")
         return
     tipos = [t for t in (perfil.get("alertas_tipos") or TIPOS) if t in TIPOS]
@@ -189,10 +153,6 @@ def main():
         if errores and not secciones:
             sys.exit("Fallaron todas las consultas; reintenta más tarde.")
         print("Nada nuevo desde la última alerta.")
-        if os.environ.get("ALERTA_SILENCIO") != "1":   # para que sepas que la alerta SÍ corrió
-            avisar("📡 Alerta SECOP: sin novedades hoy",
-                   ["Revisé convocatorias y contratos recientes y nada nuevo encaja con tu perfil."]
-                   + [f"⚠️ No pude consultar {e}" for e in errores])
         return
 
     items = []
@@ -204,7 +164,16 @@ def main():
             items.append(f"… y {len(df) - len(mostrar)} más. Míralas en la app.")
     encabezado = f"📡 {total} novedad(es) que encajan con tu perfil"
 
-    enviado = avisar(encabezado, items, estricto=True)
+    enviado = False
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if token and chat:
+        telegram(token, chat, en_bloques(encabezado, items))
+        enviado = True
+    user, pwd, destino = os.environ.get("SMTP_USER"), os.environ.get("SMTP_PASS"), os.environ.get("EMAIL_TO")
+    if user and pwd and destino:
+        correo(user, pwd, destino, encabezado, "\n\n".join(items))
+        enviado = True
+
     if not enviado:
         print("No hay Telegram ni correo configurados; muestro las alertas aquí y NO las marco como vistas:\n")
         print(encabezado + "\n\n" + "\n\n".join(items))
@@ -214,12 +183,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit as e:
-        if e.code not in (None, 0):   # error con mensaje: también te llega por Telegram/correo
-            avisar("⚠️ La alerta SECOP no pudo correr", [str(e.code)])
-        raise
-    except Exception as e:
-        avisar("⚠️ La alerta SECOP falló", [f"{type(e).__name__}: {e}"])
-        raise
+    main()
