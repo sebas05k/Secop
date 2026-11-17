@@ -1,20 +1,29 @@
+# Guárdalo en tu repositorio como: .github/workflows/alertas.yml
 name: Alertas SECOP
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # 12:00 UTC = 7:00 a. m. en Colombia (todos los días)
-  workflow_dispatch:       # permite ejecutarlo a mano desde la pestaña Actions
+    # GitHub puede retrasar o incluso descartar las ejecuciones programadas justo en punto de cada hora,
+    # por eso se usan minutos "raros". El segundo horario es un respaldo: si el primero ya envió las
+    # novedades, el segundo no manda nada (lo ya avisado no se repite).
+    - cron: "17 12 * * *"   # 12:17 UTC = 7:17 a. m. en Colombia
+    - cron: "47 12 * * *"   # 12:47 UTC = 7:47 a. m. en Colombia (respaldo)
+  workflow_dispatch:        # permite ejecutarlo a mano (Actions → Run workflow) o con el botón de la app
+
+concurrency:                # si dos ejecuciones coinciden, la segunda espera a la primera
+  group: alertas-secop
+  cancel-in-progress: false
 
 jobs:
   alertas:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests pandas "gspread>=6.1,<7" google-auth
+      - run: pip install requests pandas "gspread>=6.1,<7"
       - run: python alertas.py
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -25,3 +34,12 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+      - name: Avisar por Telegram si la alerta falló
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="⚠️ La alerta SECOP falló. Revisa GitHub → Actions → Alertas SECOP." || true
