@@ -85,6 +85,8 @@ def filtros_perfil(perfil, desde, **extra):
     hoy = date.today()
     excluir = list(perfil.get("excluir", [])) + (sc.RUIDO_TIPICO if perfil.get("quitar_ruido", True) else [])
     return sc.filtros_base(terminos=perfil.get("terminos", []), reglas=perfil.get("reglas", []), excluir_local=excluir,
+                           excluir_entidades=perfil.get("excluir_entidades", sc.ENTIDADES_RUIDO),
+                           codigos=perfil.get("codigos", []), codigos_modo=perfil.get("codigos_modo", "priorizar"),
                            deptos=perfil.get("deptos", []),
                            ciudad=perfil.get("ciudad", ""), desde=str(desde), hasta=str(hoy), limite=500, **extra)
 
@@ -115,7 +117,7 @@ def contratos_nuevos(perfil, ya):
         return df, df
     df = df[~df["clave"].isin(ya)].drop_duplicates("clave")
     # primero lo que más se parece a tu perfil (más palabras del núcleo), y a igual relevancia lo de mayor valor
-    df = df.assign(_rel=sc.puntaje(df, perfil.get("terminos", []), perfil.get("reglas", []))).sort_values(
+    df = df.assign(_rel=sc.puntaje(df, perfil.get("terminos", []), perfil.get("reglas", []), perfil.get("codigos", []))).sort_values(
         ["_rel", "valor"], ascending=False)
     directos = df["modalidad"].fillna("").str.contains("directa", case=False)
     return df[~directos], df[directos]
