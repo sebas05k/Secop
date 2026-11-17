@@ -34,6 +34,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+          ALERTA_SILENCIO: ${{ vars.ALERTA_SILENCIO }}   # opcional: ponla en 1 (Settings → Variables) para no recibir «sin novedades»
       - name: Avisar por Telegram si la alerta falló
         if: failure()
         env:
