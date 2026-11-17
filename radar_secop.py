@@ -26,6 +26,13 @@ except ImportError:
 
 st.set_page_config(page_title="Radar SECOP II", page_icon="📡", layout="wide")
 
+VERSION_ESPERADA = "2026-11-17.2"
+if getattr(sc, "VERSION", "") != VERSION_ESPERADA:
+    st.error("⚠️ Los archivos de la app no son de la misma versión. En GitHub reemplaza **secop_core.py**, **alertas.py** y "
+             "**radar_secop.py** por los últimos que te mandé (y `alertas.yml` en `.github/workflows/`). "
+             f"Ahora mismo secop_core.py es «{getattr(sc, 'VERSION', 'una versión antigua')}» y se esperaba «{VERSION_ESPERADA}».")
+    st.stop()
+
 
 def secreto(nombre, defecto=None):
     v = os.environ.get(nombre)
