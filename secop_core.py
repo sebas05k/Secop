@@ -117,6 +117,7 @@ PLANTILLAS = {
 # ---------------------------------------------------------------------------
 # API de datos.gov.co
 # ---------------------------------------------------------------------------
+VERSION = "2026-11-17.2"  # radar_secop.py y alertas.py comprueban que sea la misma versión
 TIMEOUT = 45  # segundos que se espera una respuesta de datos.gov.co
 
 
