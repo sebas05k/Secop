@@ -8,11 +8,13 @@ Dos pestañas:
 
 Archivos: radar_secop.py, secop_core.py, almacen.py (+ alertas.py y alertas.yml para los avisos).
 """
+import json
 import os
 import re
 from datetime import date, timedelta
 
 import pandas as pd
+import requests
 import streamlit as st
 
 import secop_core as sc
@@ -24,6 +26,13 @@ except ImportError:
     st_searchbox = None
 
 st.set_page_config(page_title="Radar SECOP II", page_icon="📡", layout="wide")
+
+VERSION_ESPERADA = "2026-11-18"
+if getattr(sc, "VERSION", "") != VERSION_ESPERADA:
+    st.error("⚠️ Los archivos de la app no son de la misma versión. En GitHub reemplaza **secop_core.py**, **alertas.py** y "
+             "**radar_secop.py** por los últimos que te mandé (y `alertas.yml` en `.github/workflows/`). "
+             f"Ahora mismo secop_core.py es «{getattr(sc, 'VERSION', 'una versión antigua')}» y se esperaba «{VERSION_ESPERADA}».")
+    st.stop()
 
 
 def secreto(nombre, defecto=None):
@@ -272,10 +281,11 @@ def tabla_resultados(df, pref):
 
 
 def mostrar_resultados(res, es_proceso, pref, modo=None):
-    df = res["df"].drop_duplicates("clave")
+    df = res["df"]
     if df.empty:
         st.info("Sin resultados. Prueba con menos palabras o quita filtros.")
         return
+    df = df.drop_duplicates("clave")
     if es_proceso:
         df = df.sort_values("fecha_fin")  # primero los que cierran pronto
     elif modo and not modo.startswith("📄"):
@@ -435,6 +445,28 @@ TIPOS_ALERTA = {
 }
 
 
+def disparar_alerta(prueba=False):
+    """Lanza el workflow de alertas en GitHub (equivale a Actions → Run workflow). Devuelve (ok, motivo)."""
+    token, repo = secreto("GITHUB_TOKEN"), secreto("GITHUB_REPO")
+    wf, rama = secreto("GITHUB_WORKFLOW", "alertas.yml"), secreto("GITHUB_BRANCH", "main")
+    try:
+        r = requests.post(f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
+                          headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                                   "X-GitHub-Api-Version": "2022-11-28"},
+                          json={"ref": rama, **({"inputs": {"prueba": "true"}} if prueba else {})}, timeout=20)
+    except requests.exceptions.RequestException as e:
+        return False, f"No pude conectar con GitHub: {e}"
+    if r.status_code == 204:
+        return True, ""
+    if r.status_code == 422 and "input" in r.text.lower():
+        return False, "El archivo alertas.yml que está en GitHub es una versión antigua (no tiene la opción de prueba). Reemplázalo por el nuevo."
+    causas = {401: "El token no es válido o ya venció.",
+              403: "El token no tiene el permiso «Actions: Read and write» sobre este repositorio.",
+              404: "No encontré el repositorio o el workflow. Revisa GITHUB_REPO (usuario/repositorio) y GITHUB_WORKFLOW.",
+              422: f"GitHub no pudo lanzarlo desde la rama «{rama}». Revisa GITHUB_BRANCH (¿main o master?)."}
+    return False, f"{causas.get(r.status_code, f'GitHub respondió {r.status_code}.')} ({r.text[:120]})"
+
+
 def vista_previa(perfil, tipos):
     """Muestra lo que traería la alerta hoy con estos ajustes (no envía nada ni marca nada como visto)."""
     import alertas
@@ -465,6 +497,14 @@ def vista_previa(perfil, tipos):
     with st.expander("Qué palabras y combinaciones traen más resultados"):
         st.dataframe(tabla.head(25), hide_index=True)
         st.caption("Si una fila trae muchísimos resultados que no son de tu área, bórrala o hazla más específica.")
+    cod = sc.conteo_codigos(pd.concat([df for _, df in secciones]))
+    with st.expander("Códigos UNSPSC que aparecen en tus resultados"):
+        if cod.empty:
+            st.caption("No pude leer el código UNSPSC en estos datos (la columna no apareció).")
+        else:
+            st.dataframe(cod, hide_index=True)
+            st.caption("Los que empiezan por 70 son servicios agrícolas, pesqueros y forestales. Si ves otros códigos de tu área, "
+                       "agrégalos en «Códigos UNSPSC de tu interés».")
     for titulo, df in secciones:
         st.markdown(f"**{titulo}: {len(df)}**")
         for r in df.head(8).itertuples():
@@ -519,12 +559,25 @@ def ajustes_alertas():
                                   default=[s_ for s_ in perfil.get("sectores", []) if s_ in sc.PLANTILLAS])
         excluir = st.text_input("Excluir palabras", key=f"al_exc_{v}",
                                 value=", ".join(perfil.get("excluir", []) if estricto else sc.EXCLUIR_AGRONOMO))
+        excluir_ent = st.text_input("Excluir entidades (si su nombre contiene…)", key=f"al_ent_{v}",
+                                    value=", ".join(perfil.get("excluir_entidades", sc.ENTIDADES_RUIDO)),
+                                    help="Hospitales, policía, etc.: se descartan sin importar de qué hable el contrato.")
+        codigos_txt = st.text_input("Códigos UNSPSC de tu interés (opcional)", key=f"al_cod_{v}",
+                                    value=", ".join(perfil.get("codigos", ["70"])),
+                                    help="Es el código con que la entidad clasifica el contrato en SECOP. «70» = servicios agrícolas, "
+                                         "pesqueros y forestales. Pon prefijos separados por coma.")
+        codigos_modo = st.radio("Con esos códigos…", ["priorizar", "exigir"], horizontal=True, key=f"al_codm_{v}",
+                                index=["priorizar", "exigir"].index(perfil.get("codigos_modo", "priorizar")),
+                                format_func={"priorizar": "Que salgan primero (los demás también llegan)",
+                                             "exigir": "Exigirlos (solo llegan esos)"}.get)
         deptos = st.multiselect("Departamentos (vacío = todos)", opts_depto, key=f"al_dp_{v}",
                                 default=[d for d in perfil.get("deptos", []) if d in opts_depto])
         ruido = st.checkbox("Quitar ruido típico (médicos, abogados, deportes, eventos, aseo…)", key=f"al_ruido_{v}",
                             value=bool(perfil.get("quitar_ruido", True)))
         terminos = list(dict.fromkeys([k for s_ in sectores for k in sc.PLANTILLAS[s_]] + sc.partir(nucleo)))
         reglas = sc.texto_a_reglas(combos)
+        codigos = [d for d in (re.sub(r"\D", "", x) for x in sc.partir(codigos_txt)) if d]
+        extra_filtros = dict(excluir_entidades=sc.partir(excluir_ent), codigos=codigos, codigos_modo=codigos_modo)
         malas = sc.palabras_genericas(terminos)
         if malas:
             st.warning("Estas palabras son demasiado generales y traen mucho ruido; mejor pásalas a una combinación: " + ", ".join(malas))
@@ -534,7 +587,7 @@ def ajustes_alertas():
         if st.button("👀 Ver qué traería hoy", width="stretch", key="al_prev"):
             if terminos or reglas:
                 vista_previa(dict(terminos=terminos, reglas=reglas, excluir=sc.partir(excluir), deptos=deptos,
-                                  valor_min_contratos=int(vmin), quitar_ruido=ruido), tipos or list(TIPOS_ALERTA))
+                                  valor_min_contratos=int(vmin), quitar_ruido=ruido, **extra_filtros), tipos or list(TIPOS_ALERTA))
             else:
                 st.warning("Escribe al menos una palabra o una combinación.")
         if st.button("💾 Guardar alertas", type="primary", width="stretch"):
@@ -545,8 +598,97 @@ def ajustes_alertas():
             else:
                 persistir_perfil(dict(terminos=terminos, reglas=reglas, nucleo=nucleo.strip(), combos=combos.strip(),
                                       excluir=sc.partir(excluir), deptos=deptos, sectores=sectores, alertas_tipos=tipos,
-                                      valor_min_contratos=int(vmin), quitar_ruido=ruido))
+                                      valor_min_contratos=int(vmin), quitar_ruido=ruido, **extra_filtros))
                 st.success("Alertas guardadas ✅" if ALM else "Guardado solo en esta sesión. Configura Google Sheets para que las alertas lo lean.")
+        st.divider()
+        if secreto("GITHUB_TOKEN") and secreto("GITHUB_REPO"):
+            b1, b2 = st.columns(2)
+            correr, probar = b1.button("▶️ Correr la alerta ahora", width="stretch", key="al_correr"), \
+                b2.button("🧪 Probar Telegram", width="stretch", key="al_probar")
+            if correr or probar:
+                ok, motivo = disparar_alerta(prueba=probar)
+                if ok:
+                    st.success("Prueba lanzada ✅. En 1 o 2 minutos debe llegarte un mensaje a Telegram; si no llega, abre la ejecución en GitHub."
+                               if probar else "Alerta lanzada ✅. En 1 o 2 minutos te llega un mensaje por Telegram (novedades, sin novedades o error). "
+                               "Usa lo último que guardaste con «Guardar alertas».")
+                    st.link_button("Ver la ejecución en GitHub", f"https://github.com/{secreto('GITHUB_REPO')}/actions/workflows/"
+                                   f"{secreto('GITHUB_WORKFLOW', 'alertas.yml')}")
+                else:
+                    st.error(motivo)
+        else:
+            st.caption("▶️ Para activar el botón «Correr la alerta ahora», agrega en los secretos de Streamlit: GITHUB_TOKEN "
+                       "(permiso «Actions: Read and write» solo sobre tu repositorio) y GITHUB_REPO (usuario/repositorio).")
+
+
+CLAVES_PERFIL = ("terminos", "reglas", "excluir", "excluir_entidades", "codigos", "codigos_modo", "deptos", "ciudad",
+                 "quitar_ruido", "valor_min_contratos")
+PERIODOS_ALERTA = {"Últimos 3 días": 3, "Últimos 7 días": 7, "Últimos 15 días": 15, "Últimos 30 días": 30}
+
+
+def perfil_alertas():
+    """Perfil que usan las alertas. Si todavía no guardaste uno, se usa el restrictivo de ingeniería agronómica."""
+    p = dict(st.session_state["perfil"])
+    if not (p.get("terminos") or p.get("reglas")):
+        p.update(terminos=list(sc.NUCLEO_AGRONOMO), reglas=sc.texto_a_reglas(sc.COMBOS_AGRONOMO), excluir=list(sc.EXCLUIR_AGRONOMO))
+    return p
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _alerta_convocatorias(perfil_json, dias):
+    import alertas
+    return alertas.convocatorias_nuevas(json.loads(perfil_json), set(), dias)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _alerta_contratos(perfil_json, dias):
+    import alertas
+    return alertas.contratos_nuevos(json.loads(perfil_json), set(), dias)
+
+
+def pagina_alertas():
+    """Lo mismo que envía la alerta diaria, pero aquí, en tarjetas y por tipo (sin depender de Telegram)."""
+    perfil = perfil_alertas()
+    guardado = bool(st.session_state["perfil"].get("terminos") or st.session_state["perfil"].get("reglas"))
+    st.caption("Es lo que te manda la alerta diaria, pero aquí en tarjetas y sin esperar a Telegram (incluye lo que ya te avisaron). "
+               + ("Usa tus alertas guardadas." if guardado else "Aún no guardas alertas: uso el perfil restrictivo de ingeniería agronómica. "
+                  "Ajústalo en ⭐ Guardados → 🔔 Alertas."))
+    a, b, c_ = st.columns([2, 2, 1])
+    d_conv = PERIODOS_ALERTA[a.selectbox("Convocatorias publicadas en…", list(PERIODOS_ALERTA), index=1, key="al_dconv")]
+    d_cont = PERIODOS_ALERTA[b.selectbox("Contratos firmados en…", list(PERIODOS_ALERTA), index=1, key="al_dcont")]
+    if c_.button("🔄 Actualizar", width="stretch", key="al_refrescar"):
+        st.cache_data.clear()
+    tipos = perfil.get("alertas_tipos") or list(TIPOS_ALERTA)
+    pj = json.dumps({k: perfil[k] for k in CLAVES_PERFIL if perfil.get(k) is not None}, sort_keys=True, default=str)
+    vacio, salidas = pd.DataFrame(), {}
+    with st.spinner("Consultando datos.gov.co… (la primera vez puede tardar un minuto)"):
+        if "convocatorias" in tipos:
+            try:
+                salidas["conv"] = ("ok", _alerta_convocatorias(pj, d_conv))
+            except Exception as e:
+                salidas["conv"] = ("error", str(e)[:250])
+        if "adjudicados" in tipos or "directos" in tipos:
+            try:
+                adj, dire = _alerta_contratos(pj, d_cont)
+                salidas["adj"], salidas["dir"] = ("ok", adj), ("ok", dire)
+            except Exception as e:
+                salidas["adj"] = salidas["dir"] = ("error", str(e)[:250])
+    nombres = {"conv": ("🟢 Convocatorias", "Procesos abiertos: aquí puedes postularte.", True),
+               "adj": ("🏆 Adjudicados", "Contratos recién firmados por licitación, concurso, etc. La empresa ganadora puede necesitar "
+                                          "un profesional: escríbele.", False),
+               "dir": ("🤝 Directos", "Ya están asignados a una persona. Sirven para saber qué entidades contratan perfiles como el tuyo.", False)}
+    claves = [k for k in nombres if k in salidas and (k != "adj" or "adjudicados" in tipos) and (k != "dir" or "directos" in tipos)]
+    etiquetas = [nombres[k][0] + (f" ({len(salidas[k][1])})" if salidas[k][0] == "ok" else "") for k in claves]
+    for tab, k in zip(st.tabs(etiquetas), claves):
+        with tab:
+            estado, dato = salidas[k]
+            st.caption(nombres[k][1])
+            if estado == "error":
+                st.warning(f"No pude consultar esta parte: {dato}")
+                st.button("🔄 Reintentar", key=f"al_reint_{k}")
+            elif dato.empty:
+                st.info("Nada por ahora con tu perfil en este periodo. Prueba un periodo más largo.")
+            else:
+                mostrar_resultados({"df": dato, "total": len(dato)}, nombres[k][2], f"al_{k}")
 
 
 def pagina_guardados():
@@ -602,8 +744,10 @@ def pagina_seguimiento():
 # Navegación
 # ---------------------------------------------------------------------------
 st.title("📡 Radar SECOP II")
-tab_buscar, tab_guardados = st.tabs(["🔎 Buscar", "⭐ Guardados"])
+tab_buscar, tab_alertas, tab_guardados = st.tabs(["🔎 Buscar", "🔔 Alertas", "⭐ Guardados"])
 with tab_buscar:
     pagina_buscar()
+with tab_alertas:
+    pagina_alertas()
 with tab_guardados:
     pagina_guardados()
