@@ -48,6 +48,7 @@ DATASETS = {
             "proveedor": ["proveedor_adjudicado"],
             "nit": ["documento_proveedor"],
             "url": ["urlproceso"],
+            "categoria": ["codigo_de_categoria_principal", "codigo_principal_de_categoria"],
             "contrato": ["id_contrato", "referencia_del_contrato"],
             "proceso": ["proceso_de_compra"],
             "representante": ["nombre_representante_legal"],
@@ -71,6 +72,7 @@ DATASETS = {
             "proveedor": ["nombre_del_proveedor"],
             "nit": ["nit_del_proveedor_adjudicado"],
             "url": ["urlproceso"],
+            "categoria": ["codigo_de_categoria_principal", "codigo_principal_de_categoria"],
             "contrato": ["id_del_proceso", "referencia_del_proceso"],
         },
     },
@@ -82,10 +84,11 @@ PISTAS = {
     "descripcion": r"descrip|objeto", "estado": r"^estado", "modalidad": r"modalidad",
     "valor": r"^valor|precio", "fecha": r"fecha.*(firma|publica)", "proveedor": r"proveedor|contratista",
     "nit": r"nit|documento", "url": r"^url",
+    "categoria": r"categor.*princip|princip.*categor|unspsc",
 }
 ROLES = ["entidad", "departamento", "ciudad", "titulo", "descripcion", "estado", "modalidad",
          "tipo", "valor", "fecha", "fecha_fin", "proveedor", "nit", "url",
-         "contrato", "proceso", "representante"]
+         "contrato", "proceso", "representante", "categoria"]
 BUSQUEDA = {"descripcion": ("titulo", "descripcion"), "entidad": ("entidad",), "proveedor": ("proveedor",)}
 
 # Modos de la búsqueda directa (con autocompletado)
@@ -114,6 +117,7 @@ PLANTILLAS = {
 # ---------------------------------------------------------------------------
 # API de datos.gov.co
 # ---------------------------------------------------------------------------
+VERSION = "2026-11-18"  # radar_secop.py y alertas.py comprueban que sea la misma versión
 TIMEOUT = 45  # segundos que se espera una respuesta de datos.gov.co
 
 
@@ -214,6 +218,27 @@ RUIDO_TIPICO = ["M_DICO", "M_DICA", "ODONT_LOG", "ENFERMER", "PSIC_LOG", "ABOGAD
                 "ART_STIC", "ESC_NIC", "DEPORT", "ALIMENTACI_N ESCOLAR", "VIGILANCIA", "ASEO", "CAFETER_A", "PAPELER_A",
                 "ROPA HOSPITALARIA", "DOTACI_N HOSPITALARIA", "FESTIVAL", "FIESTAS"]
 
+# Entidades cuyos contratos casi nunca interesan a un agrónomo ni a un arquitecto (hospitales, policía...)
+ENTIDADES_RUIDO = ["HOSPITAL", "E.S.E", "EMPRESA SOCIAL DEL ESTADO", "UNIDAD PRESTADORA DE SALUD", "SERVICIOS DE SALUD",
+                   "SECRETAR_A DE SALUD", "CL_NICA", "POLIC_A", "FUERZAS MILITARES"]
+
+
+def _con_codigo(df, codigos):
+    """Filas cuyo código UNSPSC empieza por alguno de los prefijos (ej. '70' = servicios agrícolas, pesqueros y forestales)."""
+    codigos = [c for c in codigos if c]
+    if not codigos or "categoria" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["categoria"].fillna("").str.match("|".join(codigos))
+
+
+def conteo_codigos(df, n=15):
+    """Códigos UNSPSC más frecuentes entre los resultados (para elegir cuáles te interesan)."""
+    if "categoria" not in df.columns or df["categoria"].isna().all():
+        return pd.DataFrame(columns=["codigo", "resultados"])
+    t = df["categoria"].dropna().value_counts().head(n)
+    return pd.DataFrame({"codigo": t.index, "resultados": t.values})
+
+
 # Palabras que, solas, aparecen en casi cualquier contrato: no sirven como palabra clave
 _GENERALES = {"PRESTACI_N", "PRESTAR", "SERVICIO", "SERVICIOS", "PROFESIONAL", "PROFESIONALES", "APOYO", "GESTI_N", "ASESOR_A",
               "ASESOR", "ASESORAR", "CONSULTOR_A", "ESTUDIO", "ESTUDIOS", "DIAGN_STICO", "CAPACITACI_N", "FORMACI_N", "EDUCACI_N",
@@ -239,14 +264,15 @@ def _coincide_regla(textos, regla):
     return ok
 
 
-def puntaje(df, terminos, reglas=()):
-    """Relevancia de cada fila: 2 puntos por palabra del núcleo y 1 por combinación cumplida (para ordenar)."""
+def puntaje(df, terminos, reglas=(), codigos=()):
+    """Relevancia de cada fila: 2 puntos por palabra del núcleo, 1 por combinación cumplida y 3 si su código UNSPSC es de los tuyos."""
     textos = df["texto"].fillna("").str.upper()
     p = pd.Series(0, index=df.index)
     for t in terminos:
         p += 2 * textos.str.contains(_rx(t), regex=True).astype(int)
     for r in reglas:
         p += _coincide_regla(textos, r).astype(int)
+    p += 3 * _con_codigo(df, codigos).astype(int)
     return p
 
 
@@ -396,6 +422,7 @@ def normalizar(df, c, tope):
     out["valor"] = out["valor"].where(out["valor"] <= tope)
     for col in ("fecha", "fecha_fin"):
         out[col] = pd.to_datetime(out[col], errors="coerce")
+    out["categoria"] = out["categoria"].astype(str).str.extract(r"(\d{6,8})", expand=False)
     out["vigente"] = out["fecha_fin"] >= pd.Timestamp.today().normalize()
     out["texto"] = (out["titulo"].fillna("") + " " + out["descripcion"].fillna("")).str.strip()
     out["clave"] = [clave_registro(u, k, e, t) for u, k, e, t in zip(out["url"], out["contrato"], out["entidad"], out["texto"])]
@@ -420,6 +447,11 @@ def ejecutar(ds, c, f, traer_fn=traer):
         if len(wheres) > 1:  # una fila puede coincidir en varias consultas
             df = df.drop_duplicates("clave")
             total = len(df)
+        if f.get("excluir_entidades"):  # entidades a descartar (por nombre)
+            rx_e = "|".join(_rx(t) for t in f["excluir_entidades"])
+            df = df[~df["entidad"].fillna("").str.upper().str.contains(rx_e, regex=True)]
+        if f.get("codigos") and f.get("codigos_modo") == "exigir":  # solo contratos con esos códigos UNSPSC
+            df = df[_con_codigo(df, f["codigos"])]
         if f.get("excluir_local"):  # palabras a descartar DESPUÉS de bajar los datos (no alargan la consulta)
             rx = "|".join(_rx(t) for t in f["excluir_local"])
             df = df[~df["texto"].fillna("").str.upper().str.contains(rx, regex=True)]
